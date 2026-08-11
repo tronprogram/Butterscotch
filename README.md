@@ -1,13 +1,17 @@
 # This fork - Nintendo Wii (AI-assisted)
 
 > [!NOTE]
-> This repository is a **fork of [ButterscotchRunner/Butterscotch](https://github.com/ButterscotchRunner/Butterscotch)** focused on a **native Nintendo Wii** port. The Wii work was built **with AI assistance** (Cursor / Codex agents). It is experimental and not affiliated with or endorsed by the upstream project.
+> This repository is a **fork of [ButterscotchRunner/Butterscotch](https://github.com/ButterscotchRunner/Butterscotch)** focused on a **native Nintendo Wii** port. The Wii work was built **with AI assistance** (Cursor / Codex agents) for my own amusement. No warranties this'll work properly or get updated!
 
-| | |
-|---|---|
-| Upstream | https://github.com/ButterscotchRunner/Butterscotch |
-| Fork focus | `PLATFORM=wii` - native GX renderer, AESND audio, HBC `boot.dol` packaging |
-| Open todos | [`TODO-wii.md`](TODO-wii.md) |
+
+|            |                                                                                                          |
+| ---------- | -------------------------------------------------------------------------------------------------------- |
+| Upstream   | [https://github.com/ButterscotchRunner/Butterscotch](https://github.com/ButterscotchRunner/Butterscotch) |
+| Fork focus | `PLATFORM=wii` - native GX renderer, AESND audio, HBC `boot.dol` packaging                               |
+| Open todos | [`TODO-wii.md`](TODO-wii.md)                                                                             |
+
+
+
 
 ### Build & run (Wii)
 
@@ -38,21 +42,13 @@ Copy the `apps/butterscotch` folder to a Dolphin/HBC SD card and place `data.win
 
 ---
 
+
+
 # Upstream README
 
 The content below is from upstream Butterscotch, kept here for reference. Wii-specific instructions live **only** in the fork section above.
 
-<div align="center">
-<img width="256" height="256" alt="Butterscotch Logo" src="https://github.com/user-attachments/assets/ef8bdd5c-d407-4b3c-a4d5-07b25e8bbc70" />
-</div>
-
-<h1 align="center">🥧 Butterscotch 🥧</h1>
-
-<!-- Badges, about the GitHub repository itself -->
-<p align="center">
-<a href="https://github.com/ButterscotchRunner/CompatibilityList"><img src="https://img.shields.io/badge/butterscotch-compatibility_list-green"></a>
-<a href="https://discord.gg/2gQR7t3WJR"><img src="https://img.shields.io/discord/1406856655920168971?color=5865F2&logo=discord&logoColor=white&label=discord"></a>
-</p>
+# 🥧 Butterscotch 🥧
 
 > [!IMPORTANT]
 > Butterscotch is still VERY early in development and it is NOT that good yet.
@@ -65,9 +61,9 @@ Ever since I created Droidtale 10+ years ago, I had that lingering thought in my
 
 And that's where Butterscotch comes in! Butterscotch is an open source re-implementation of GameMaker: Studio's runner.
 
-**Butterscotch Web (WASM):** https://butterscotch.mrpowergamerbr.com/web/
+**Butterscotch Web (WASM):** [https://butterscotch.mrpowergamerbr.com/web/](https://butterscotch.mrpowergamerbr.com/web/)
 
-**Butterscotch PlayStation 2 ISO Generator:** https://butterscotch.mrpowergamerbr.com/
+**Butterscotch PlayStation 2 ISO Generator:** [https://butterscotch.mrpowergamerbr.com/](https://butterscotch.mrpowergamerbr.com/)
 
 ## Game Compatibility
 
@@ -77,16 +73,16 @@ While our target is Undertale v1.08, that doesn't mean that other games CAN'T ru
 
 Butterscotch supports the following WAD versions:
 
-* WAD Version 8 (GameMaker: Studio 1.0.198+)
-* WAD Version 9 (GameMaker: Studio 1.0.527+)
-* WAD Version 10 (GameMaker: Studio 1.1.609+)
-* WAD Version 11 (GameMaker: Studio 1.1.754+)
-* WAD Version 12 (GameMaker: Studio 1.1.867+)
-* WAD Version 13 (GameMaker: Studio 1.1.917+)
-* WAD Version 14 (GameMaker: Studio 1.4.1464+)
-* WAD Version 15 (GameMaker: Studio 1.4.1675+)
-* WAD Version 16 (GameMaker: Studio 1.4.1767+)
-* WAD Version 17 (GameMaker: Studio 2.2+)
+- WAD Version 8 (GameMaker: Studio 1.0.198+)
+- WAD Version 9 (GameMaker: Studio 1.0.527+)
+- WAD Version 10 (GameMaker: Studio 1.1.609+)
+- WAD Version 11 (GameMaker: Studio 1.1.754+)
+- WAD Version 12 (GameMaker: Studio 1.1.867+)
+- WAD Version 13 (GameMaker: Studio 1.1.917+)
+- WAD Version 14 (GameMaker: Studio 1.4.1464+)
+- WAD Version 15 (GameMaker: Studio 1.4.1675+)
+- WAD Version 16 (GameMaker: Studio 1.4.1767+)
+- WAD Version 17 (GameMaker: Studio 2.2+)
 
 Other modding tools, such as UndertaleModTool, calls it "bytecode version" instead of "WAD version". We decided to go with WAD version instead because there are GameMaker: Studio versions (WAD version 6 and 7) that DO NOT use bytecode altogether, so calling it "bytecode version" is not quite correct, and because that's what the YoYo Runner calls it under the hood.
 
@@ -96,40 +92,49 @@ However, that doesn't mean that a game that uses a compatible version WILL run! 
 
 Of course, there are exceptions that break game compatibility altogether:
 
-* Games compiled with YYC, because they use native code instead of bytecode.
-* Games compiled with the new [GMRT](https://github.com/YoYoGames/GMRT-Beta/tree/main), because they use native code instead of bytecode.
+- Games compiled with YYC, because they use native code instead of bytecode.
+- Games compiled with the new [GMRT](https://github.com/YoYoGames/GMRT-Beta/tree/main), because they use native code instead of bytecode.
+
+
 
 ## Supported Platforms
 
-* Windows
-* Web
-* PlayStation 2
-* PlayStation 3
-* PlayStation Vita
-* ...and maybe more in the future!
+- Windows
+- Web
+- PlayStation 2
+- PlayStation 3
+- PlayStation Vita
+- ...and maybe more in the future!
 
 Additionally, any platform with reasonably complete C and POSIX conformance should work, the following have been tested.
-* Linux with glibc as old as about ~1996
-* FreeBSD as old as 2.2.8
-* Haiku
+
+- Linux with glibc as old as about ~1996
+- FreeBSD as old as 2.2.8
+- Haiku
 
 The following backends are available for desktop platforms (Windows and POSIX systems).
-* GLFW 2
-* GLFW 3
-* SDL 1.2
-* SDL 2
-* SDL 3
+
+- GLFW 2
+- GLFW 3
+- SDL 1.2
+- SDL 2
+- SDL 3
 
 The following compilers have been tested to successfully build butterscotch, older versions may work but are untested.
-* GCC 2.7 and up in C++ mode, and 3.0 and up in C99 mode
-* Clang 1.1 and up
-* TinyCC 0.9.27 and up
-* MSVC 4.0 and up
+
+- GCC 2.7 and up in C++ mode, and 3.0 and up in C99 mode
+- Clang 1.1 and up
+- TinyCC 0.9.27 and up
+- MSVC 4.0 and up
+
+
 
 ## Community Ports
 
-* [Xbox 360 (Butterscotch-360)](https://github.com/ceilingtilefan/Butterscotch-360) by @ceilingtilefan
-* [3DS and Wii U (Cinnamon)](https://github.com/Project-Sunshine-Native/cinnamon) by @casrielasriel, @grayforz24682, @d16.dorian, @ralcactus
+- [Xbox 360 (Butterscotch-360)](https://github.com/ceilingtilefan/Butterscotch-360) by @ceilingtilefan
+- [3DS and Wii U (Cinnamon)](https://github.com/Project-Sunshine-Native/cinnamon) by @casrielasriel, @grayforz24682, @d16.dorian, @ralcactus
+
+
 
 ## Building Butterscotch
 
@@ -201,17 +206,21 @@ The desktop target has a lot of nifty CLI parameters that you can use to trace a
 --disable-log-colors                   - Same as --disable-log-colours, but different spelling
 ```
 
+
+
 ## Debug Features
 
 When running Butterscotch with `--debug`, the following hotkeys are enabled:
 
-* `Page Up`: Moves forward one room
-* `Page Down`: Moves backwards one room
-* `P`: Pauses the game
-* `O`: While paused, advances the game loop by one frame
-* `F12`: Dumps the current runner state to the console
-* `F11`: Dumps the current runner state to the console (JSON format), or dumps it to a file if `--dump-frame-json-file` is set.
-* `F10`: Sets the `global.interact` flag to `0`. Useful in Undertale when you are moving through rooms and one of them starts a cutscene that doesn't let you move.
+- `Page Up`: Moves forward one room
+- `Page Down`: Moves backwards one room
+- `P`: Pauses the game
+- `O`: While paused, advances the game loop by one frame
+- `F12`: Dumps the current runner state to the console
+- `F11`: Dumps the current runner state to the console (JSON format), or dumps it to a file if `--dump-frame-json-file` is set.
+- `F10`: Sets the `global.interact` flag to `0`. Useful in Undertale when you are moving through rooms and one of them starts a cutscene that doesn't let you move.
+
+
 
 ## Performance
 
@@ -227,75 +236,57 @@ Having a transpiler also have other disadvantages:
 1. You lose the ability of debugging the runner at a "high level" by tracing opcodes.
 2. Compilation is SLOW, transpiling Undertale in a naive way to C and building it takes 90 seconds on a modern computer, and building it to other targets is so slow that I wasn't even able to test it.
 
+
+
 ## Screenshots
+
+
 
 ### Undertale (GLFW) [WAD Version 16]
 
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/6651cc2e-0d6d-4354-b98d-081e84a981df" />
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/1d6edc51-2829-4f8f-b900-393f21a6655b" />
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/0d41f16c-7ee5-47de-a2e8-5831cdcd2745" />
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/45dc47fb-6d8a-44d4-8cbb-2e5791100144" />
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/7db1c869-e625-4558-9119-0f23da0f020c" />
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/71fc7616-d580-48fe-aa6d-1e6ceea41bdb" />
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/4098936e-a1b9-4971-901d-702ec390afa7" />
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/dd3dcce3-3d78-452f-9af0-27133497650c" />
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/2e356d04-5aaf-47d4-9bc3-4abba78cd18d" />
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/a9cbc57f-e9c1-4985-a6af-a98e5fce5ff3" />
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/e5c67781-0ffc-43c8-9c7d-333254eed704" />
-<img width="160" height="120" alt="Image" src="https://github.com/user-attachments/assets/93900e3c-79b5-4a05-bd6c-d68814e9e101" />
+
 
 ### Undertale (PlayStation 2) [WAD Version 16]
 
-Here's a video :3 https://youtu.be/PuzBxe0VGtY
+Here's a video :3 [https://youtu.be/PuzBxe0VGtY](https://youtu.be/PuzBxe0VGtY)
 
-Here's also another video, this time showing off the Asriel Dreemurr final battle https://youtu.be/vkQMqXr0MQE
+Here's also another video, this time showing off the Asriel Dreemurr final battle [https://youtu.be/vkQMqXr0MQE](https://youtu.be/vkQMqXr0MQE)
 
 ### DELTARUNE (SURVEY_PROGRAM) (PlayStation 2) [WAD Version 16]
 
-Here's a video :3 https://youtu.be/TLJtV2WnrmQ
+Here's a video :3 [https://youtu.be/TLJtV2WnrmQ](https://youtu.be/TLJtV2WnrmQ)
 
 ### DELTARUNE Chapter 2 (GLFW) [WAD Version 17]
 
-<img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/d0df9858-ad2b-4642-9f32-a542d1d942e0" />
+
 
 ### DELTARUNE Chapter 2 (PlayStation 2) [WAD Version 17]
 
-Here's a video :3 https://youtu.be/uuN72Hv50d4
+Here's a video :3 [https://youtu.be/uuN72Hv50d4](https://youtu.be/uuN72Hv50d4)
 
 ### DELTARUNE Chapter 3 (GLFW) [WAD Version 17]
 
-<img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/7b49d434-e66f-4ee3-bfe8-c0b4f45ceeb7" />
-<img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/afbe62ad-4706-4882-a9c9-6c239ed57c69" />
-<img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/d83c9f8c-e9b9-410e-8d3d-3663ede23fab" />
+
 
 ### DELTARUNE Chapter 3 (PlayStation 2) [WAD Version 17]
 
-Here's a video :3 https://youtu.be/c9r79sQABYg
+Here's a video :3 [https://youtu.be/c9r79sQABYg](https://youtu.be/c9r79sQABYg)
 
 ### DELTARUNE Chapter Selector (GLFW) [WAD Version 17]
 
-<img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/b8a848df-fd1c-49b7-9602-e8020ac86d5d" />
+
 
 ### Undertale 10th Anniversary (GLFW) [WAD Version 17]
 
-<img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/4ec0c64e-23f1-4bb1-8291-6aaf626a690f" />
-<img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/4ea7d078-784d-4861-aeb1-4ee2d1d70508" />
-<img width="160" height="120" alt="image" src="https://github.com/user-attachments/assets/45eb5be9-5e7b-4930-bb7e-2f2c49c76a49" />
+
 
 ### NXTALE (Undertale for Xbox One) (GLFW) [WAD Version 17]
 
-<img width="160" alt="image" src="https://github.com/user-attachments/assets/7c4e2224-76e4-495e-8382-fad2dbdef207" />
-<img width="160" alt="image" src="https://github.com/user-attachments/assets/6af34191-66c6-44dd-8712-907641520073" />
-<img width="160" alt="image" src="https://github.com/user-attachments/assets/150aec4c-8cfb-4cef-9db0-f339158b0d14" />
-<img width="160" alt="image" src="https://github.com/user-attachments/assets/4e3489e8-11de-4c8c-953c-f7b776bb4eb8" />
+
 
 ### AM2R (GLFW) [WAD Version 14]
 
-<img width="160" alt="image" src="https://github.com/user-attachments/assets/3e46dfed-487c-4d91-9cd5-c71adc7a6cb5" />
-<img width="160" alt="image" src="https://github.com/user-attachments/assets/4a4b6da1-dae4-4d0f-8611-12e7a1fc8d8c" />
-<img width="160" alt="image" src="https://github.com/user-attachments/assets/d522be68-1003-4208-bf6b-d59a004606ba" />
+
 
 ### GameMaker: Studio Platformer Demo (GLFW) [WAD Version 10]
 
-<img width="160" alt="image" src="https://github.com/user-attachments/assets/e8cd174c-5113-416b-9e3a-c4029e1e3176" />
-<img width="160" alt="image" src="https://github.com/user-attachments/assets/3702a261-01fe-4b04-9e6c-b69336c2ce46" />
