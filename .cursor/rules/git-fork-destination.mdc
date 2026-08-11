@@ -1,0 +1,11 @@
+---
+description: Git remotes — only merge/push to tronprogram/Butterscotch fork
+alwaysApply: true
+---
+
+# Butterscotch git destination
+
+- **Canonical remote for this fork:** `origin` = `https://github.com/tronprogram/Butterscotch.git`
+- When merging feature work, merge into local `main` and **push only to `tronprogram/Butterscotch`** (`origin`).
+- **Do not** open PRs against, push to, or treat as merge destination: `ButterscotchRunner/Butterscotch` (upstream).
+- Do not add or push to other remotes unless the user explicitly names them.
