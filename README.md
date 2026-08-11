@@ -36,6 +36,15 @@ export DEVKITPRO=/c/msys64/opt/devkitpro
 ./scripts/build-wii.sh
 ```
 
+macOS / Linux (no host toolchain — official Docker image):
+
+```bash
+./scripts/build-wii-docker.sh   # uses devkitpro/devkitppc (linux/arm64 on Apple Silicon)
+./scripts/run-wii-dolphin.sh    # mainline Dolphin; brew install --cask dolphin
+```
+
+Felk Python-scripting Dolphin + `mcp-dolphin` remain a **Windows** debug path (`scripts/run-wii-dolphin-mcp.ps1`); Felk does not ship macOS scripting builds.
+
 Outputs `build-wii/butterscotch.dol` and stages `build-wii/apps/butterscotch/{boot.dol,meta.xml}`.
 
 Copy the `apps/butterscotch` folder to a Dolphin/HBC SD card and place `data.win` (and optional `CONFIG.JSN`) beside `boot.dol`. Default Wiimote map: D-pad -> arrows, A->Z, B->X, +->Enter, Minus->Shift, 1->C, 2->Escape.

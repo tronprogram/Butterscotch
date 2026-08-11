@@ -28,6 +28,10 @@ endif()
 
 project(butterscotch C)
 
+if(PLATFORM STREQUAL "wii")
+  enable_language(ASM)
+endif()
+
 if (PLATFORM STREQUAL "vita")
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 set(VITA_APP_NAME "Butterscotch")
@@ -824,6 +828,10 @@ elseif(PLATFORM STREQUAL "wii")
     target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/wii)
     target_include_directories(butterscotch SYSTEM PUBLIC vendor/stb/image)
 
+    file(GLOB DEBUG_FONT_SOURCES src/debug_font/*.c)
+    target_sources(butterscotch PRIVATE ${DEBUG_FONT_SOURCES})
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/debug_font)
+
     target_compile_options(butterscotch PRIVATE
         -fsingle-precision-constant
         -fomit-frame-pointer
@@ -856,6 +864,12 @@ elseif(PLATFORM STREQUAL "wii")
         stb_ds
         sha1
         stb_vorbis
+    )
+
+    # Replace default rvl.ld (gcc skips stock -T when driver sees -T).
+    # Pads PT_LOAD filesz to 32B so elf2dol emits IPL/IOS-legal DOLs.
+    target_link_options(butterscotch PRIVATE
+        "SHELL:-T ${CMAKE_SOURCE_DIR}/cmake/wii/butterscotch-wii.ld"
     )
 
     ogc_create_dol(butterscotch)

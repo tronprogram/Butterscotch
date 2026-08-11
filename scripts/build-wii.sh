@@ -47,13 +47,24 @@ cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_TOOLCHAIN_FILE="${DEVKITPRO}/cmake/Wii.cmake"
 
-cmake --build "${REPO_ROOT}/build-wii" -j"$(nproc 2>/dev/null || echo 4)"
-
-echo ""
-echo "Build complete."
+JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+cmake --build "${REPO_ROOT}/build-wii" -j"${JOBS}"
 
 DOL_BOOT="${REPO_ROOT}/build-wii/apps/butterscotch/boot.dol"
 DOL_MAIN="${REPO_ROOT}/build-wii/butterscotch.dol"
+
+VALIDATE_SCRIPT="${SCRIPT_DIR}/validate-wii-dol.py"
+if command -v python3 >/dev/null 2>&1 && [[ -f "${VALIDATE_SCRIPT}" ]]; then
+  VAL_ARGS=()
+  [[ -f "${DOL_MAIN}" ]] && VAL_ARGS+=("${DOL_MAIN}")
+  [[ -f "${DOL_BOOT}" ]] && VAL_ARGS+=("${DOL_BOOT}")
+  if ((${#VAL_ARGS[@]})); then
+    python3 "${VALIDATE_SCRIPT}" "${VAL_ARGS[@]}"
+  fi
+fi
+
+echo ""
+echo "Build complete."
 
 if [ -f "${DOL_BOOT}" ]; then
     echo "HBC package : ${DOL_BOOT}"

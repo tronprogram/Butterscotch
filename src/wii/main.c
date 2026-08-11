@@ -19,6 +19,7 @@
 #include "../overlay_file_system.h"
 #include "gx_renderer.h"
 #include "noop_audio_system.h"
+#include "wii_overlay.h"
 #include "../utils.h"
 #include "../gettime.h"
 
@@ -86,6 +87,11 @@ static void installDefaultMappings(void) {
 static void pollWpad(Runner* runner) {
     WPAD_ScanPads();
     uint32_t held = WPAD_ButtonsHeld(0);
+    uint32_t down = WPAD_ButtonsDown(0);
+
+    if (down & WPAD_BUTTON_HOME) {
+        WiiOverlay_toggleDebugOverlay(runner);
+    }
 
     repeat(wiiMappingCount, i) {
         uint32_t mask   = wiiMappings[i].wpadButton;
@@ -144,6 +150,9 @@ int main(int argc, char* argv[]) {
     GX_SetCullMode(GX_CULL_NONE);
     GX_CopyDisp(xfb0, GX_TRUE);
     GX_SetDispCopyGamma(GX_GM_1_0);
+
+    // Heap budget baseline after XFBs/FIFO so MEM1/MEM2 used/total are meaningful.
+    WiiOverlay_snapshotArenas();
 
     logInfo("Butterscotch Wii - VIDEO and GX initialized (%dx%d)\n",
             rmode->fbWidth, rmode->efbHeight);
@@ -316,34 +325,52 @@ int main(int argc, char* argv[]) {
 
     logInfo("Entering main loop (%dx%d game, %dx%d display)\n", gameW, gameH, winW, winH);
 
+    WiiOverlay_init();
+
     uint64_t lastTime = nowNanos();
 
     // ===[ Main Loop ]===
     while (!runner->shouldExit) {
-        uint64_t now      = nowNanos();
-        uint64_t deltaNs  = now - lastTime;
-        lastTime          = now;
+        uint64_t frameStart = nowNanos();
+        uint64_t deltaNs  = frameStart - lastTime;
+        lastTime          = frameStart;
         runner->deltaTime = (double)deltaNs / 1000.0;
 
         pollWpad(runner);
 
+        uint64_t stepStart = nowNanos();
         Runner_step(runner);
+        uint64_t stepEnd = nowNanos();
 
         Runner_drawPre(runner, winW, winH);
         Runner_beginFrame(runner, gameW, gameH, winW, winH, winW, winH);
+
+        uint64_t drawStart = nowNanos();
         Runner_drawViews(runner, gameW, gameH, false);
         runner->viewCurrent = 0;
         renderer->vtable->endFrameInit(renderer);
         Runner_drawPost(runner, winW, winH);
         renderer->vtable->endFrameEnd(renderer);
         Runner_drawGUI(runner, winW, winH, gameW, gameH);
+        uint64_t drawEnd = nowNanos();
 
         RunnerKeyboard_beginFrame(runner->keyboard);
 
         uint32_t roomSpeed = runner->currentRoom->speed;
         float dt = (roomSpeed > 0) ? (1.0f / (float)roomSpeed) : (1.0f / 30.0f);
         if (dt > 0.1f) dt = 0.1f;
+
+        uint64_t audioStart = nowNanos();
         audioSystem->vtable->update(audioSystem, dt);
+        uint64_t audioEnd = nowNanos();
+
+        float tickMs = (float)((double)(audioEnd - frameStart) / 1e6);
+        float stepMs = (float)((double)(stepEnd - stepStart) / 1e6);
+        float drawMs = (float)((double)(drawEnd - drawStart) / 1e6);
+        float audioMs = (float)((double)(audioEnd - audioStart) / 1e6);
+        float frameDeltaMs = (float)((double)deltaNs / 1e6);
+        WiiOverlay_drawDebugOverlay(renderer, runner, tickMs, stepMs, drawMs, audioMs,
+                                    frameDeltaMs, winW, winH);
 
         GxRenderer_present(renderer);
 
@@ -351,10 +378,11 @@ int main(int argc, char* argv[]) {
 
         if (roomSpeed > 0) {
             uint64_t targetNs = (uint64_t)(1000000000ULL / roomSpeed);
-            while ((nowNanos() - lastTime) < targetNs) {}
+            while ((nowNanos() - frameStart) < targetNs) {}
         }
     }
 
+    WiiOverlay_deinit();
     audioSystem->vtable->destroy(audioSystem);
     renderer->vtable->destroy(renderer);
     DataWin_free(dataWin);

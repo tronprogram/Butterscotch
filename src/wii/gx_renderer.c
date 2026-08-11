@@ -1,5 +1,6 @@
 #include "gx_renderer.h"
 #include "matrix_math.h"
+#include "text_utils.h"
 #include "utils.h"
 #include "data_win.h"
 #include "image_decoder.h"
@@ -13,6 +14,7 @@
 #include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 // ===[ Internal struct ]===
 
@@ -42,7 +44,15 @@ typedef struct {
     int32_t* texSliceCounts;
     int32_t* texW;
     int32_t* texH;
+    int32_t* texScale; // 1 = native; 2+ = nearest downscale applied on upload
     bool* texLoaded;
+    uint64_t* texLastUsed;
+    uint64_t* texTriedFrame;  // last frame we attempted a load (within-frame dedupe)
+    uint64_t* texRetryAfter;  // earliest frame allowed to retry after transient fail
+    uint8_t* texFailCount;    // exponential backoff for OOM / decode thrash
+    uint64_t frameCounter;
+    int32_t boundPageId;      // last GX_LoadTexObj page (-1 = none)
+    int32_t boundSliceIndex;  // last loaded slice within that page
     GXTexObj whiteTex;
     uint8_t* whiteTexData;
     int32_t appSurfW, appSurfH;
@@ -154,99 +164,417 @@ static inline void setTEVSolid(void) {
 
 // ===[ Texture loading ]===
 
-static bool ensureTexLoaded(GxRendererImpl* gx, uint32_t pageId) {
-    if (gx->texLoaded[pageId]) return gx->texW[pageId] != 0;
-    gx->texLoaded[pageId] = true;
+// RGB5A3 halves residency vs RGBA8 so room working sets (BG + Frisk + Toriel + FX)
+// fit under Wii heap pressure. Decode still peaks as temporary RGBA.
+#define GX_TEX_BPP 2u
+#define GX_TEX_RESIDENT_BUDGET (40ull * 1024ull * 1024ull)
 
-    DataWin* dw = gx->base.dataWin;
-    Texture* txtr = &dw->txtr.textures[pageId];
-    DataWin_loadTxtrIfNeeded(dw, pageId);
-    if (!txtr->blobData) return false;
-
-    int w = 0, h = 0;
-    bool gm2022_5 = DataWin_isVersionAtLeast(dw, 2022, 5, 0, 0);
-    uint8_t* pixels = ImageDecoder_decodeToRgba(txtr->blobData, (size_t)txtr->blobSize, gm2022_5, &w, &h);
-    if (!pixels) {
-        logWarn("GxRenderer: Failed to decode TXTR page %u\n", pageId);
-        return false;
+static inline uint16_t packRgb5a3(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    if (a >= 224) {
+        return (uint16_t)(0x8000u | ((uint16_t)(r >> 3) << 10) | ((uint16_t)(g >> 3) << 5) | (uint16_t)(b >> 3));
     }
+    return (uint16_t)(((uint16_t)(a >> 5) << 12) | ((uint16_t)(r >> 4) << 8) |
+                      ((uint16_t)(g >> 4) << 4) | (uint16_t)(b >> 4));
+}
 
-    if (!txtr->mapped) {
-        free(txtr->blobData);
-        txtr->blobData = nullptr;
-    }
-
-    // Wii RGBA8 requires 4x4 tile alignment, and GX texture dimensions are capped at 1024.
-    // GameMaker atlases commonly use 1024x2048 pages, so keep their coordinate space but
-    // upload them as <=1024-high vertical slices selected per TPAG at draw time.
-    int pw = (w + 3) & ~3;
-    int ph = (h + 3) & ~3;
-    if (pw > 1024) {
-        free(pixels);
-        logWarn("GxRenderer: TXTR page %u is %d pixels wide; GX maximum is 1024\n", pageId, pw);
-        return false;
-    }
-
-    int sliceCount = (ph + 1023) / 1024;
-    GxTextureSlice* slices = (GxTextureSlice*)safeCalloc((size_t)sliceCount, sizeof(GxTextureSlice));
-    int tilesX = pw / 4;
-    for (int sliceIndex = 0; sliceIndex < sliceCount; sliceIndex++) {
-        GxTextureSlice* slice = &slices[sliceIndex];
-        slice->y = sliceIndex * 1024;
-        slice->height = ph - slice->y;
-        if (slice->height > 1024) slice->height = 1024;
-        size_t bufSize = (size_t)pw * (size_t)slice->height * 4;
-        slice->data = (uint8_t*)memalign(32, bufSize);
-        if (!slice->data) {
-            for (int i = 0; i < sliceIndex; i++) free(slices[i].data);
-            free(slices);
-            free(pixels);
-            logWarn("GxRenderer: memalign failed for TXTR page %u slice %d\n", pageId, sliceIndex);
-            return false;
+static void freeTexPage(GxRendererImpl* gx, uint32_t pageId) {
+    if (!gx->texSlices || pageId >= gx->textureCount) return;
+    GxTextureSlice* slices = gx->texSlices[pageId];
+    if (slices) {
+        for (int32_t i = 0; i < gx->texSliceCounts[pageId]; i++) {
+            free(slices[i].data);
+            slices[i].data = NULL;
         }
-        memset(slice->data, 0, bufSize);
+        free(slices);
+    }
+    gx->texSlices[pageId] = NULL;
+    gx->texSliceCounts[pageId] = 0;
+    gx->texW[pageId] = 0;
+    gx->texH[pageId] = 0;
+    gx->texScale[pageId] = 1;
+    gx->texLoaded[pageId] = false;
+    gx->texLastUsed[pageId] = 0;
+    if (gx->boundPageId == (int32_t)pageId) {
+        gx->boundPageId = -1;
+        gx->boundSliceIndex = -1;
+    }
+}
 
-        // Convert RGBA linear to Wii RGBA8 tiled (4x4 tiles, AR plane then GB plane).
-        int tilesY = slice->height / 4;
-        for (int ty = 0; ty < tilesY; ty++) {
-            for (int tx = 0; tx < tilesX; tx++) {
-                uint8_t* tile = slice->data + (ty * tilesX + tx) * 64;
-                for (int row = 0; row < 4; row++) {
-                    for (int col = 0; col < 4; col++) {
-                        int px = tx * 4 + col;
-                        int py = slice->y + ty * 4 + row;
-                        uint8_t R = 0, G = 0, B = 0, A = 0;
-                        if (px < w && py < h) {
-                            const uint8_t* p = pixels + (py * w + px) * 4;
-                            R = p[0]; G = p[1]; B = p[2]; A = p[3];
-                        }
-                        int idx = row * 4 + col;
-                        tile[idx * 2]          = A;
-                        tile[idx * 2 + 1]      = R;
-                        tile[32 + idx * 2]     = G;
-                        tile[32 + idx * 2 + 1] = B;
+static uint64_t residentTexBytes(const GxRendererImpl* gx) {
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < gx->textureCount; i++) {
+        if (!gx->texLoaded[i] || !gx->texSlices[i] || gx->texW[i] == 0) continue;
+        for (int32_t s = 0; s < gx->texSliceCounts[i]; s++) {
+            if (gx->texSlices[i][s].data) {
+                total += (uint64_t)gx->texW[i] * (uint64_t)gx->texSlices[i][s].height * (uint64_t)GX_TEX_BPP;
+            }
+        }
+    }
+    return total;
+}
+
+static bool evictLRUTexPage(GxRendererImpl* gx, uint32_t excludePageId) {
+    // Prefer idle pages; if none, allow same-frame eviction so character atlases can
+    // stream in when BG pages would otherwise pin the entire budget forever.
+    // Backoff on load failure prevents the old re-decode crawl.
+    uint32_t bestIdle = UINT32_MAX;
+    uint64_t bestIdleUsed = UINT64_MAX;
+    uint32_t bestAny = UINT32_MAX;
+    uint64_t bestAnyUsed = UINT64_MAX;
+
+    for (uint32_t i = 0; i < gx->textureCount; i++) {
+        if (i == excludePageId) continue;
+        if (!gx->texLoaded[i] || !gx->texSlices[i] || gx->texW[i] == 0) continue;
+        uint64_t used = gx->texLastUsed[i];
+        if (used < bestAnyUsed) {
+            bestAnyUsed = used;
+            bestAny = i;
+        }
+        if (used < gx->frameCounter && used < bestIdleUsed) {
+            bestIdleUsed = used;
+            bestIdle = i;
+        }
+    }
+    uint32_t best = (bestIdle != UINT32_MAX) ? bestIdle : bestAny;
+    if (best == UINT32_MAX) return false;
+    logInfo("GxRenderer: Evicting TXTR page %u (lastUsed=%llu frame=%llu)\n",
+        best, (unsigned long long)gx->texLastUsed[best], (unsigned long long)gx->frameCounter);
+    freeTexPage(gx, best);
+    GX_InvalidateTexAll();
+    return true;
+}
+
+static void markTexTransientFail(GxRendererImpl* gx, uint32_t pageId, const char* why) {
+    uint8_t fails = gx->texFailCount[pageId];
+    if (fails < 255) gx->texFailCount[pageId] = (uint8_t)(fails + 1);
+    // 1,2,4,8,16,32… capped at ~2s @30fps so we don't soft-lock forever.
+    uint32_t shift = fails < 5 ? fails : 5;
+    uint64_t cool = 1ull << shift;
+    if (cool > 60ull) cool = 60ull;
+    gx->texRetryAfter[pageId] = gx->frameCounter + cool;
+    // Rate-limit: first failure + every 8th thereafter.
+    if (fails == 0 || (fails & 7u) == 0u) {
+        logWarn("GxRenderer: %s (page %u, retry in %llu frames, fails=%u)\n",
+            why, pageId, (unsigned long long)cool, (unsigned)gx->texFailCount[pageId]);
+    }
+}
+
+static void ensureTexBudget(GxRendererImpl* gx, uint32_t excludePageId, uint64_t upcomingBytes) {
+    while (residentTexBytes(gx) + upcomingBytes > GX_TEX_RESIDENT_BUDGET) {
+        if (!evictLRUTexPage(gx, excludePageId)) break;
+    }
+}
+
+static void* allocTexBytes(GxRendererImpl* gx, uint32_t excludePageId, size_t bytes) {
+    for (;;) {
+        void* ptr = memalign(32, bytes);
+        if (ptr) return ptr;
+        if (!evictLRUTexPage(gx, excludePageId)) return NULL;
+    }
+}
+
+static void* allocHeapBytes(GxRendererImpl* gx, uint32_t excludePageId, size_t bytes) {
+    for (;;) {
+        void* ptr = malloc(bytes);
+        if (ptr) return ptr;
+        if (!evictLRUTexPage(gx, excludePageId)) return NULL;
+    }
+}
+
+static bool peekPngSize(const uint8_t* blob, size_t blobSize, int* outW, int* outH) {
+    if (blobSize < 24) return false;
+    static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    if (memcmp(blob, sig, 8) != 0) return false;
+    // IHDR length(4) + type(4) + width/height
+    uint32_t w = ((uint32_t)blob[16] << 24) | ((uint32_t)blob[17] << 16) | ((uint32_t)blob[18] << 8) | blob[19];
+    uint32_t h = ((uint32_t)blob[20] << 24) | ((uint32_t)blob[21] << 16) | ((uint32_t)blob[22] << 8) | blob[23];
+    if (w == 0 || h == 0 || w > 8192 || h > 8192) return false;
+    *outW = (int)w;
+    *outH = (int)h;
+    return true;
+}
+
+// WTL1: offline-tiled atlas (see scripts/repack-wii-face-atlases.py).
+// magic "WTL1" + u32 width,height,tileH,tileCount + tileCount×(u32 offset,u32 size) + PNG tiles.
+static bool peekWtl1Size(const uint8_t* blob, size_t blobSize, int* outW, int* outH, uint32_t* outTileCount) {
+    if (blobSize < 20) return false;
+    if (blob[0] != 'W' || blob[1] != 'T' || blob[2] != 'L' || blob[3] != '1') return false;
+    uint32_t w = (uint32_t)blob[4] | ((uint32_t)blob[5] << 8) | ((uint32_t)blob[6] << 16) | ((uint32_t)blob[7] << 24);
+    uint32_t h = (uint32_t)blob[8] | ((uint32_t)blob[9] << 8) | ((uint32_t)blob[10] << 16) | ((uint32_t)blob[11] << 24);
+    uint32_t tileCount = (uint32_t)blob[16] | ((uint32_t)blob[17] << 8) | ((uint32_t)blob[18] << 16) | ((uint32_t)blob[19] << 24);
+    if (w == 0 || h == 0 || w > 1024 || h > 8192 || tileCount == 0 || tileCount > 32) return false;
+    if (blobSize < 20u + tileCount * 8u) return false;
+    *outW = (int)w;
+    *outH = (int)h;
+    if (outTileCount) *outTileCount = tileCount;
+    return true;
+}
+
+static void downsampleRgbaNNInPlace(uint8_t* px, int w, int h, int scale, int* outW, int* outH) {
+    int dw = w / scale;
+    int dh = h / scale;
+    for (int y = 0; y < dh; y++) {
+        for (int x = 0; x < dw; x++) {
+            const uint8_t* s = px + (((y * scale) * w) + (x * scale)) * 4;
+            uint8_t* d = px + (y * dw + x) * 4;
+            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+        }
+    }
+    *outW = dw;
+    *outH = dh;
+}
+
+static void bindTexSlice(GxRendererImpl* gx, int32_t pageId, int32_t sliceIndex, GxTextureSlice* slice) {
+    if (gx->boundPageId == pageId && gx->boundSliceIndex == sliceIndex) return;
+    GX_LoadTexObj(&slice->obj, GX_TEXMAP0);
+    gx->boundPageId = pageId;
+    gx->boundSliceIndex = sliceIndex;
+}
+
+// Pack one vertical GX slice from tile-local RGBA (0..srcH rows, width srcW).
+static bool uploadRgb5a3Slice(
+    GxRendererImpl* gx, uint32_t pageId, GxTextureSlice* slice,
+    const uint8_t* pixels, int srcW, int srcH, int pw
+) {
+    int phSlice = srcH;
+    if (phSlice > 1024) phSlice = 1024;
+    phSlice = (phSlice + 3) & ~3;
+    if (phSlice > 1024) phSlice = 1024;
+    slice->height = phSlice;
+
+    size_t bufSize = (size_t)pw * (size_t)slice->height * GX_TEX_BPP;
+    slice->data = (uint8_t*)allocTexBytes(gx, pageId, bufSize);
+    if (!slice->data) return false;
+    memset(slice->data, 0, bufSize);
+
+    int tilesX = pw / 4;
+    int tilesY = slice->height / 4;
+    for (int ty = 0; ty < tilesY; ty++) {
+        for (int tx = 0; tx < tilesX; tx++) {
+            uint16_t* tile = (uint16_t*)(slice->data + (ty * tilesX + tx) * 32);
+            for (int row = 0; row < 4; row++) {
+                for (int col = 0; col < 4; col++) {
+                    int px = tx * 4 + col;
+                    int py = ty * 4 + row;
+                    uint8_t R = 0, G = 0, B = 0, A = 0;
+                    if (px < srcW && py < srcH) {
+                        const uint8_t* p = pixels + (py * srcW + px) * 4;
+                        R = p[0]; G = p[1]; B = p[2]; A = p[3];
                     }
+                    tile[row * 4 + col] = packRgb5a3(R, G, B, A);
                 }
             }
         }
-
-        GX_InitTexObj(&slice->obj, slice->data, (u16)pw, (u16)slice->height,
-                      GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
-        GX_InitTexObjFilterMode(&slice->obj, GX_NEAR, GX_NEAR);
-        DCFlushRange(slice->data, bufSize);
     }
 
-    free(pixels);
-    GX_InvalidateTexAll();
+    GX_InitTexObj(&slice->obj, slice->data, (u16)pw, (u16)slice->height,
+                  GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+    GX_InitTexObjFilterMode(&slice->obj, GX_NEAR, GX_NEAR);
+    DCFlushRange(slice->data, bufSize);
+    return true;
+}
 
+static bool finishTexPageLoad(
+    GxRendererImpl* gx, uint32_t pageId, Texture* txtr,
+    GxTextureSlice* slices, int sliceCount, int pw, int ph, int scale, int w, int h
+) {
+    if (!txtr->mapped && txtr->blobData) {
+        free(txtr->blobData);
+        txtr->blobData = nullptr;
+    }
+    GX_InvalidateTexAll();
+    gx->boundPageId = -1;
+    gx->boundSliceIndex = -1;
     gx->texSlices[pageId] = slices;
     gx->texSliceCounts[pageId] = sliceCount;
     gx->texW[pageId] = pw;
     gx->texH[pageId] = ph;
-
-    logInfo("GxRenderer: Loaded TXTR page %u (%dx%d padded to %dx%d, %d GX slice%s)\n",
-        pageId, w, h, pw, ph, sliceCount, sliceCount == 1 ? "" : "s");
+    gx->texScale[pageId] = scale;
+    gx->texLoaded[pageId] = true;
+    gx->texLastUsed[pageId] = gx->frameCounter;
+    gx->texFailCount[pageId] = 0;
+    gx->texRetryAfter[pageId] = 0;
+    logInfo("GxRenderer: Loaded TXTR page %u (%dx%d padded to %dx%d, scale=%d, %d GX slice%s, RGB5A3 resident=%.1fMB)\n",
+        pageId, w, h, pw, ph, scale, sliceCount, sliceCount == 1 ? "" : "s",
+        (double)residentTexBytes(gx) / (1024.0 * 1024.0));
     return true;
+}
+
+static bool loadWtl1TexPage(GxRendererImpl* gx, uint32_t pageId, Texture* txtr, bool gm2022_5) {
+    const uint8_t* blob = txtr->blobData;
+    size_t blobSize = (size_t)txtr->blobSize;
+    int w = 0, h = 0;
+    uint32_t tileCount = 0;
+    if (!peekWtl1Size(blob, blobSize, &w, &h, &tileCount)) {
+        markTexTransientFail(gx, pageId, "Invalid WTL1 TXTR");
+        return false;
+    }
+
+    int pw = (w + 3) & ~3;
+    int ph = (h + 3) & ~3;
+    if (pw > 1024) {
+        gx->texLoaded[pageId] = true;
+        logWarn("GxRenderer: WTL1 page %u too wide (%d)\n", pageId, pw);
+        return false;
+    }
+
+    ensureTexBudget(gx, pageId, (uint64_t)pw * (uint64_t)ph * (uint64_t)GX_TEX_BPP);
+
+    GxTextureSlice* slices = (GxTextureSlice*)allocHeapBytes(gx, pageId, (size_t)tileCount * sizeof(GxTextureSlice));
+    if (!slices) {
+        markTexTransientFail(gx, pageId, "WTL1 slice table alloc failed");
+        return false;
+    }
+    memset(slices, 0, (size_t)tileCount * sizeof(GxTextureSlice));
+
+    // tileH is at offset 12
+    uint32_t tileH = (uint32_t)blob[12] | ((uint32_t)blob[13] << 8) | ((uint32_t)blob[14] << 16) | ((uint32_t)blob[15] << 24);
+    if (tileH == 0 || tileH > 1024) tileH = 1024;
+
+    for (uint32_t i = 0; i < tileCount; i++) {
+        const uint8_t* ent = blob + 20 + i * 8;
+        uint32_t off = (uint32_t)ent[0] | ((uint32_t)ent[1] << 8) | ((uint32_t)ent[2] << 16) | ((uint32_t)ent[3] << 24);
+        uint32_t sz  = (uint32_t)ent[4] | ((uint32_t)ent[5] << 8) | ((uint32_t)ent[6] << 16) | ((uint32_t)ent[7] << 24);
+        if ((size_t)off + (size_t)sz > blobSize || sz == 0) {
+            for (uint32_t j = 0; j < i; j++) free(slices[j].data);
+            free(slices);
+            markTexTransientFail(gx, pageId, "WTL1 tile out of range");
+            return false;
+        }
+
+        int tw = 0, th = 0;
+        uint8_t* pixels = ImageDecoder_decodeToRgba(blob + off, (size_t)sz, gm2022_5, &tw, &th);
+        if (!pixels) {
+            for (uint32_t j = 0; j < i; j++) free(slices[j].data);
+            free(slices);
+            markTexTransientFail(gx, pageId, "Failed to decode WTL1 tile");
+            return false;
+        }
+
+        GxTextureSlice* slice = &slices[i];
+        slice->y = (int32_t)(i * tileH);
+        // Tile-local pixels: srcOriginY=0, srcH=th
+        if (!uploadRgb5a3Slice(gx, pageId, slice, pixels, tw, th, pw)) {
+            ImageDecoder_freeRgba(pixels);
+            for (uint32_t j = 0; j < i; j++) free(slices[j].data);
+            free(slices);
+            markTexTransientFail(gx, pageId, "memalign failed for WTL1 slice");
+            return false;
+        }
+        ImageDecoder_freeRgba(pixels);
+    }
+
+    return finishTexPageLoad(gx, pageId, txtr, slices, (int)tileCount, pw, ph, 1, w, h);
+}
+
+static bool ensureTexLoaded(GxRendererImpl* gx, uint32_t pageId) {
+    if (gx->texLoaded[pageId] && gx->texW[pageId] != 0) {
+        gx->texLastUsed[pageId] = gx->frameCounter;
+        return true;
+    }
+
+    // Permanent logical failure (no blob / corrupt) keeps texLoaded set with texW==0.
+    if (gx->texLoaded[pageId] && gx->texW[pageId] == 0) return false;
+
+    // Transient OOM: exponential backoff so Draw does not re-decode every frame.
+    if (gx->frameCounter < gx->texRetryAfter[pageId]) return false;
+    // Only one attempt per page per frame (many sprites share an atlas).
+    if (gx->texTriedFrame[pageId] == gx->frameCounter) return false;
+    gx->texTriedFrame[pageId] = gx->frameCounter;
+
+    DataWin* dw = gx->base.dataWin;
+    Texture* txtr = &dw->txtr.textures[pageId];
+    DataWin_loadTxtrIfNeeded(dw, pageId);
+    if (!txtr->blobData) {
+        gx->texLoaded[pageId] = true; // permanent
+        return false;
+    }
+
+    bool gm2022_5 = DataWin_isVersionAtLeast(dw, 2022, 5, 0, 0);
+
+    // Prefer WTL1 (tiled) face/battle atlases — decode peak is one 1024-tall PNG.
+    int peekW = 0, peekH = 0;
+    uint32_t peekTiles = 0;
+    if (peekWtl1Size(txtr->blobData, (size_t)txtr->blobSize, &peekW, &peekH, &peekTiles)) {
+        ensureTexBudget(gx, pageId,
+            (uint64_t)((peekW + 3) & ~3) * (uint64_t)((peekH + 3) & ~3) * (uint64_t)GX_TEX_BPP);
+        return loadWtl1TexPage(gx, pageId, txtr, gm2022_5);
+    }
+
+    if (peekPngSize(txtr->blobData, (size_t)txtr->blobSize, &peekW, &peekH)) {
+        int scale = 1;
+        while (peekW / scale > 1024) scale *= 2;
+        uint64_t uploadBytes = (uint64_t)((peekW / scale + 3) & ~3) *
+                               (uint64_t)((peekH / scale + 3) & ~3) * (uint64_t)GX_TEX_BPP;
+        // Resident upload only. Full RGBA decode is temporary malloc (libogc may use MEM2
+        // via sbrk). Face atlases (2048²) may still fail under pressure — do not carve a
+        // permanent MEM2 scratch here; that starved the heap (Frisk/transitions broke).
+        ensureTexBudget(gx, pageId, uploadBytes);
+    } else {
+        ensureTexBudget(gx, pageId, 8ull * 1024ull * 1024ull);
+    }
+
+    int w = 0, h = 0;
+    uint8_t* pixels = ImageDecoder_decodeToRgba(txtr->blobData, (size_t)txtr->blobSize, gm2022_5, &w, &h);
+    if (!pixels) {
+        markTexTransientFail(gx, pageId, "Failed to decode TXTR");
+        return false;
+    }
+
+    // Keep compressed blob until upload succeeds so mid-pipeline OOM does not
+    // force an SD re-read + full decode on every later attempt.
+
+    // Wide GameMaker atlases (2048x…) exceed GX's 1024 cap. Nearest-neighbor downscale
+    // keeps one vertical-slice pipeline and cuts residency 4x for 2048x2048 pages.
+    int scale = 1;
+    while (w / scale > 1024) scale *= 2;
+    if (scale > 1) {
+        int dwScale = 0, dhScale = 0;
+        downsampleRgbaNNInPlace(pixels, w, h, scale, &dwScale, &dhScale);
+        w = dwScale;
+        h = dhScale;
+        logInfo("GxRenderer: Downscaled TXTR page %u by %dx for GX limits\n", pageId, scale);
+    }
+
+    int pw = (w + 3) & ~3;
+    int ph = (h + 3) & ~3;
+    if (pw > 1024) {
+        ImageDecoder_freeRgba(pixels);
+        gx->texLoaded[pageId] = true; // permanent — still too wide
+        logWarn("GxRenderer: TXTR page %u still too wide after downscale (%d)\n", pageId, pw);
+        return false;
+    }
+
+    ensureTexBudget(gx, pageId, (uint64_t)pw * (uint64_t)ph * (uint64_t)GX_TEX_BPP);
+
+    int sliceCount = (ph + 1023) / 1024;
+    GxTextureSlice* slices = (GxTextureSlice*)allocHeapBytes(gx, pageId, (size_t)sliceCount * sizeof(GxTextureSlice));
+    if (!slices) {
+        ImageDecoder_freeRgba(pixels);
+        markTexTransientFail(gx, pageId, "slice table alloc failed for TXTR");
+        return false;
+    }
+    memset(slices, 0, (size_t)sliceCount * sizeof(GxTextureSlice));
+
+    for (int sliceIndex = 0; sliceIndex < sliceCount; sliceIndex++) {
+        GxTextureSlice* slice = &slices[sliceIndex];
+        slice->y = sliceIndex * 1024;
+        int rem = ph - slice->y;
+        int segH = rem > 1024 ? 1024 : rem;
+        // Full-page buffer: pass srcH=ph and srcOriginY=slice->y semantics via upload helper.
+        // Use tile-local view: pointer into pixel rows at slice->y.
+        const uint8_t* rowBase = pixels + (size_t)slice->y * (size_t)w * 4;
+        if (!uploadRgb5a3Slice(gx, pageId, slice, rowBase, w, segH, pw)) {
+            for (int i = 0; i < sliceIndex; i++) free(slices[i].data);
+            free(slices);
+            ImageDecoder_freeRgba(pixels);
+            markTexTransientFail(gx, pageId, "memalign failed for TXTR slice");
+            return false;
+        }
+    }
+
+    ImageDecoder_freeRgba(pixels);
+    return finishTexPageLoad(gx, pageId, txtr, slices, sliceCount, pw, ph, scale, w, h);
 }
 
 static bool resolveTpag(GxRendererImpl* gx, int32_t tpagIndex,
@@ -262,18 +590,80 @@ static bool resolveTpag(GxRendererImpl* gx, int32_t tpagIndex,
     return true;
 }
 
-static GxTextureSlice* resolveTextureSlice(GxRendererImpl* gx, int32_t pageId,
-                                           int32_t sourceY, int32_t sourceHeight) {
-    if (sourceY < 0 || sourceHeight <= 0) return nullptr;
-    int32_t sliceIndex = sourceY / 1024;
-    if (sliceIndex < 0 || sliceIndex >= gx->texSliceCounts[pageId]) return nullptr;
-    GxTextureSlice* slice = &gx->texSlices[pageId][sliceIndex];
-    if (sourceY + sourceHeight > slice->y + slice->height) {
-        logWarn("GxRenderer: texture rect y=%d..%d crosses GX slice boundary on page %d\n",
-            sourceY, sourceY + sourceHeight, pageId);
-        return nullptr;
+static inline void mapAtlasRect(const GxRendererImpl* gx, int32_t pageId,
+                                int32_t x, int32_t y, int32_t w, int32_t h,
+                                int32_t* mx, int32_t* my, int32_t* mw, int32_t* mh) {
+    int32_t scale = gx->texScale[pageId];
+    if (scale < 1) scale = 1;
+    *mx = x / scale;
+    *my = y / scale;
+    *mw = w / scale;
+    *mh = h / scale;
+    if (*mw < 1 && w > 0) *mw = 1;
+    if (*mh < 1 && h > 0) *mh = 1;
+}
+
+static void emitTexQuad(
+    float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3,
+    float u0, float v0, float u1, float v1,
+    uint8_t r, uint8_t g, uint8_t b, uint8_t a
+);
+
+// Draw a source rectangle that may span vertical GX slices. Destination is a screen-space
+// quad (TL,TR,BR,BL). Vertically subdivides by bilinear lerp so rotated sprites still work.
+static void emitTexturedAtlasRect(
+    GxRendererImpl* gx, int32_t pageId,
+    int32_t sourceX, int32_t sourceY, int32_t sourceW, int32_t sourceH,
+    float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3,
+    uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    if (sourceW <= 0 || sourceH <= 0) return;
+
+    int32_t mx, my, mw, mh;
+    mapAtlasRect(gx, pageId, sourceX, sourceY, sourceW, sourceH, &mx, &my, &mw, &mh);
+    if (mw <= 0 || mh <= 0) return;
+    if (mx < 0 || my < 0) return;
+    if (mx + mw > gx->texW[pageId] || my + mh > gx->texH[pageId]) return;
+
+    float tw = (float)gx->texW[pageId];
+    int32_t yCursor = my;
+    int32_t yEnd = my + mh;
+
+    setTEVTextured();
+    applyBlend(gx);
+
+    while (yCursor < yEnd) {
+        int32_t sliceIndex = yCursor / 1024;
+        if (sliceIndex < 0 || sliceIndex >= gx->texSliceCounts[pageId]) break;
+        GxTextureSlice* slice = &gx->texSlices[pageId][sliceIndex];
+        int32_t sliceEnd = slice->y + slice->height;
+        int32_t segH = yEnd < sliceEnd ? (yEnd - yCursor) : (sliceEnd - yCursor);
+        if (segH <= 0) break;
+
+        float t0 = (float)(yCursor - my) / (float)mh;
+        float t1 = (float)(yCursor + segH - my) / (float)mh;
+
+        // Bilerp top/bottom edges of the destination quad.
+        float sx0 = x0 + (x3 - x0) * t0;
+        float sy0 = y0 + (y3 - y0) * t0;
+        float sx1 = x1 + (x2 - x1) * t0;
+        float sy1 = y1 + (y2 - y1) * t0;
+        float sx2 = x1 + (x2 - x1) * t1;
+        float sy2 = y1 + (y2 - y1) * t1;
+        float sx3 = x0 + (x3 - x0) * t1;
+        float sy3 = y0 + (y3 - y0) * t1;
+
+        float th = (float)slice->height;
+        float u0 = (float)mx / tw;
+        float u1 = (float)(mx + mw) / tw;
+        float v0 = (float)(yCursor - slice->y) / th;
+        float v1 = (float)(yCursor + segH - slice->y) / th;
+
+        bindTexSlice(gx, pageId, sliceIndex, slice);
+        emitTexQuad(sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, u0, v0, u1, v1, r, g, b, a);
+
+        yCursor += segH;
     }
-    return slice;
 }
 
 // ===[ Draw quad helpers ]===
@@ -331,7 +721,16 @@ static void gxInit(Renderer* renderer, DataWin* dataWin) {
     gx->texSliceCounts = (int32_t*)safeCalloc(gx->textureCount, sizeof(int32_t));
     gx->texW      = (int32_t*)safeCalloc(gx->textureCount, sizeof(int32_t));
     gx->texH      = (int32_t*)safeCalloc(gx->textureCount, sizeof(int32_t));
+    gx->texScale  = (int32_t*)safeCalloc(gx->textureCount, sizeof(int32_t));
     gx->texLoaded = (bool*)safeCalloc(gx->textureCount, sizeof(bool));
+    gx->texLastUsed = (uint64_t*)safeCalloc(gx->textureCount, sizeof(uint64_t));
+    gx->texTriedFrame = (uint64_t*)safeCalloc(gx->textureCount, sizeof(uint64_t));
+    gx->texRetryAfter = (uint64_t*)safeCalloc(gx->textureCount, sizeof(uint64_t));
+    gx->texFailCount = (uint8_t*)safeCalloc(gx->textureCount, sizeof(uint8_t));
+    gx->frameCounter = 1;
+    gx->boundPageId = -1;
+    gx->boundSliceIndex = -1;
+    for (uint32_t i = 0; i < gx->textureCount; i++) gx->texScale[i] = 1;
 
     // White 4x4 RGBA8 tiled texture: AR plane all 0xFF, GB plane all 0xFF.
     gx->whiteTexData = (uint8_t*)memalign(32, 64);
@@ -386,16 +785,18 @@ static void gxInit(Renderer* renderer, DataWin* dataWin) {
 static void gxDestroy(Renderer* renderer) {
     GxRendererImpl* gx = (GxRendererImpl*)renderer;
     for (uint32_t i = 0; i < gx->textureCount; i++) {
-        for (int32_t slice = 0; slice < gx->texSliceCounts[i]; slice++) {
-            free(gx->texSlices[i][slice].data);
-        }
-        free(gx->texSlices[i]);
+        freeTexPage(gx, i);
     }
     free(gx->texSlices);
     free(gx->texSliceCounts);
     free(gx->texW);
     free(gx->texH);
+    free(gx->texScale);
     free(gx->texLoaded);
+    free(gx->texLastUsed);
+    free(gx->texTriedFrame);
+    free(gx->texRetryAfter);
+    free(gx->texFailCount);
     free(gx->whiteTexData);
     free(gx);
 }
@@ -404,6 +805,10 @@ static void gxDestroy(Renderer* renderer) {
 
 static void gxBeginFrame(Renderer* renderer, int32_t gameW, int32_t gameH, int32_t windowW, int32_t windowH) {
     GxRendererImpl* gx = (GxRendererImpl*)renderer;
+    gx->frameCounter++;
+    if (gx->frameCounter == 0) gx->frameCounter = 1;
+    gx->boundPageId = -1;
+    gx->boundSliceIndex = -1;
     gx->gameW   = gameW;
     gx->gameH   = gameH;
     gx->windowW = windowW;
@@ -457,12 +862,14 @@ static void gxBeginView(Renderer* renderer,
     renderer->cameraCurrent = renderer->runner->views[viewCurrent].cameraId;
     GMLCamera* cam = Runner_getCameraById(renderer->runner, renderer->cameraCurrent);
 
-    // Use the runner's expanded view rect (same as mouse mapping), not Orthographic(-H)+LookAt.
+    // Keep the runner's expanded integer rectangle, but restore the camera's fractional
+    // origin so subpixel camera movement is not snapped away.
     Matrix4f viewMatrix;
     Matrix4f_identity(&viewMatrix);
     Matrix4f projMatrix;
-    Matrix4f_viewProjection(&projMatrix,
-        (float)viewX, (float)viewY, (float)viewW, (float)viewH, viewAngle);
+    float fracX = (float)viewX + ((float)cam->viewX - truncf((float)cam->viewX));
+    float fracY = (float)viewY + ((float)cam->viewY - truncf((float)cam->viewY));
+    Matrix4f_viewProjection(&projMatrix, fracX, fracY, (float)viewW, (float)viewH, viewAngle);
     cam->viewMatrix = viewMatrix;
     cam->projectionMatrix = projMatrix;
     renderer->vtable->applyProjection(renderer, &viewMatrix, &projMatrix);
@@ -590,15 +997,6 @@ static void gxDrawSprite(Renderer* renderer, int32_t tpagIndex,
     TexturePageItem* tpag;
     int32_t pageId;
     if (!resolveTpag(gx, tpagIndex, &tpag, &pageId)) return;
-    GxTextureSlice* slice = resolveTextureSlice(gx, pageId, tpag->sourceY, tpag->sourceHeight);
-    if (!slice) return;
-
-    float tw = (float)gx->texW[pageId];
-    float th = (float)slice->height;
-    float u0 = (float)tpag->sourceX / tw;
-    float v0 = (float)(tpag->sourceY - slice->y) / th;
-    float u1 = (float)(tpag->sourceX + tpag->sourceWidth)  / tw;
-    float v1 = (float)(tpag->sourceY - slice->y + tpag->sourceHeight) / th;
 
     float lx0 = (float)tpag->targetX - originX;
     float ly0 = (float)tpag->targetY - originY;
@@ -619,11 +1017,9 @@ static void gxDrawSprite(Renderer* renderer, int32_t tpagIndex,
 
     uint8_t r = BGR_R(color), g = BGR_G(color), b = BGR_B(color);
     uint8_t a = alphaToU8(alpha);
-
-    GX_LoadTexObj(&slice->obj, GX_TEXMAP0);
-    setTEVTextured();
-    applyBlend(gx);
-    emitTexQuad(sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, u0, v0, u1, v1, r, g, b, a);
+    emitTexturedAtlasRect(gx, pageId,
+        tpag->sourceX, tpag->sourceY, tpag->sourceWidth, tpag->sourceHeight,
+        sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, r, g, b, a);
 }
 
 static void gxDrawSpritePart(Renderer* renderer, int32_t tpagIndex,
@@ -635,16 +1031,6 @@ static void gxDrawSpritePart(Renderer* renderer, int32_t tpagIndex,
     TexturePageItem* tpag;
     int32_t pageId;
     if (!resolveTpag(gx, tpagIndex, &tpag, &pageId)) return;
-    int32_t sourceY = (int32_t)tpag->sourceY + srcOffY;
-    GxTextureSlice* slice = resolveTextureSlice(gx, pageId, sourceY, srcH);
-    if (!slice) return;
-
-    float tw = (float)gx->texW[pageId];
-    float th = (float)slice->height;
-    float u0 = (float)(tpag->sourceX + srcOffX) / tw;
-    float v0 = (float)(sourceY - slice->y) / th;
-    float u1 = (float)(tpag->sourceX + srcOffX + srcW) / tw;
-    float v1 = (float)(sourceY - slice->y + srcH) / th;
 
     float qx0 = x,                         qy0 = y;
     float qx1 = x + (float)srcW * xscale,  qy1 = y;
@@ -672,11 +1058,9 @@ static void gxDrawSpritePart(Renderer* renderer, int32_t tpagIndex,
 
     uint8_t r = BGR_R(color), g = BGR_G(color), b = BGR_B(color);
     uint8_t a = alphaToU8(alpha);
-
-    GX_LoadTexObj(&slice->obj, GX_TEXMAP0);
-    setTEVTextured();
-    applyBlend(gx);
-    emitTexQuad(sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, u0, v0, u1, v1, r, g, b, a);
+    emitTexturedAtlasRect(gx, pageId,
+        (int32_t)tpag->sourceX + srcOffX, (int32_t)tpag->sourceY + srcOffY, srcW, srcH,
+        sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, r, g, b, a);
 }
 
 static void gxDrawSpritePos(Renderer* renderer, int32_t tpagIndex,
@@ -687,15 +1071,6 @@ static void gxDrawSpritePos(Renderer* renderer, int32_t tpagIndex,
     TexturePageItem* tpag;
     int32_t pageId;
     if (!resolveTpag(gx, tpagIndex, &tpag, &pageId)) return;
-    GxTextureSlice* slice = resolveTextureSlice(gx, pageId, tpag->sourceY, tpag->sourceHeight);
-    if (!slice) return;
-
-    float tw = (float)gx->texW[pageId];
-    float th = (float)slice->height;
-    float u0 = (float)tpag->sourceX / tw;
-    float v0 = (float)(tpag->sourceY - slice->y) / th;
-    float u1 = (float)(tpag->sourceX + tpag->sourceWidth)  / tw;
-    float v1 = (float)(tpag->sourceY - slice->y + tpag->sourceHeight) / th;
 
     float sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3;
     TRANSFORM_CORNER(&gx->wvp, x1, y1, gx->portW, gx->portH, gx->portX, gx->portY, sx0, sy0);
@@ -703,11 +1078,9 @@ static void gxDrawSpritePos(Renderer* renderer, int32_t tpagIndex,
     TRANSFORM_CORNER(&gx->wvp, x3, y3, gx->portW, gx->portH, gx->portX, gx->portY, sx2, sy2);
     TRANSFORM_CORNER(&gx->wvp, x4, y4, gx->portW, gx->portH, gx->portX, gx->portY, sx3, sy3);
 
-    uint8_t a = alphaToU8(alpha);
-    GX_LoadTexObj(&slice->obj, GX_TEXMAP0);
-    setTEVTextured();
-    applyBlend(gx);
-    emitTexQuad(sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, u0, v0, u1, v1, 255, 255, 255, a);
+    emitTexturedAtlasRect(gx, pageId,
+        tpag->sourceX, tpag->sourceY, tpag->sourceWidth, tpag->sourceHeight,
+        sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, 255, 255, 255, alphaToU8(alpha));
 }
 
 static void gxDrawSpriteTiled(Renderer* renderer, int32_t tpagIndex,
@@ -719,21 +1092,12 @@ static void gxDrawSpriteTiled(Renderer* renderer, int32_t tpagIndex,
     TexturePageItem* tpag;
     int32_t pageId;
     if (!resolveTpag(gx, tpagIndex, &tpag, &pageId)) return;
-    GxTextureSlice* slice = resolveTextureSlice(gx, pageId, tpag->sourceY, tpag->sourceHeight);
-    if (!slice) return;
 
     float axs = fabsf(xscale);
     float ays = fabsf(yscale);
     float tileW = (float)tpag->boundingWidth  * axs;
     float tileH = (float)tpag->boundingHeight * ays;
     if (tileW < 0.5f || tileH < 0.5f) return;
-
-    float tw = (float)gx->texW[pageId];
-    float th = (float)slice->height;
-    float u0 = (float)tpag->sourceX / tw;
-    float v0 = (float)(tpag->sourceY - slice->y) / th;
-    float u1 = (float)(tpag->sourceX + tpag->sourceWidth)  / tw;
-    float v1 = (float)(tpag->sourceY - slice->y + tpag->sourceHeight) / th;
 
     float lx0 = (float)tpag->targetX - originX;
     float ly0 = (float)tpag->targetY - originY;
@@ -764,10 +1128,6 @@ static void gxDrawSpriteTiled(Renderer* renderer, int32_t tpagIndex,
     uint8_t r = BGR_R(color), g = BGR_G(color), b = BGR_B(color);
     uint8_t a = alphaToU8(alpha);
 
-    GX_LoadTexObj(&slice->obj, GX_TEXMAP0);
-    setTEVTextured();
-    applyBlend(gx);
-
     int32_t tilesY = (int32_t)((endY - startY) / tileH) + 1;
     int32_t tilesX = (int32_t)((endX - startX) / tileW) + 1;
 
@@ -787,7 +1147,9 @@ static void gxDrawSpriteTiled(Renderer* renderer, int32_t tpagIndex,
             TRANSFORM_CORNER(&gx->wvp, vx1, vy0, gx->portW, gx->portH, gx->portX, gx->portY, sx1, sy1);
             TRANSFORM_CORNER(&gx->wvp, vx1, vy1, gx->portW, gx->portH, gx->portX, gx->portY, sx2, sy2);
             TRANSFORM_CORNER(&gx->wvp, vx0, vy1, gx->portW, gx->portH, gx->portX, gx->portY, sx3, sy3);
-            emitTexQuad(sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, u0, v0, u1, v1, r, g, b, a);
+            emitTexturedAtlasRect(gx, pageId,
+                tpag->sourceX, tpag->sourceY, tpag->sourceWidth, tpag->sourceHeight,
+                sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, r, g, b, a);
         }
     }
 }
@@ -971,22 +1333,309 @@ static void gxDrawTriangle(Renderer* renderer,
     setTEVTextured();
 }
 
-static void gxDrawText(MAYBE_UNUSED Renderer* renderer,
-    MAYBE_UNUSED const char* text,
-    MAYBE_UNUSED float x, MAYBE_UNUSED float y,
-    MAYBE_UNUSED float xscale, MAYBE_UNUSED float yscale,
-    MAYBE_UNUSED float angleDeg, MAYBE_UNUSED float lineSeparation) {}
+// ===[ Text drawing ]===
 
-static void gxDrawTextColor(MAYBE_UNUSED Renderer* renderer,
-    MAYBE_UNUSED const char* text,
-    MAYBE_UNUSED float x, MAYBE_UNUSED float y,
-    MAYBE_UNUSED float xscale, MAYBE_UNUSED float yscale,
-    MAYBE_UNUSED float angleDeg,
-    MAYBE_UNUSED int32_t c1, MAYBE_UNUSED int32_t c2,
-    MAYBE_UNUSED int32_t c3, MAYBE_UNUSED int32_t c4,
-    MAYBE_UNUSED float alpha, MAYBE_UNUSED float lineSeparation) {}
+typedef struct {
+    Font* font;
+    TexturePageItem* fontTpag;
+    int32_t fontTpagIndex;
+    int32_t pageId;
+    Sprite* spriteFontSprite;
+} GxFontState;
+
+typedef struct {
+    int32_t pageId;
+    int32_t sourceX, sourceY, sourceW, sourceH;
+    float localX0, localY0;
+} GxGlyphDraw;
+
+static bool gxResolveFontState(GxRendererImpl* gx, DataWin* dw, Font* font, GxFontState* state) {
+    state->font = font;
+    state->fontTpag = nullptr;
+    state->fontTpagIndex = -1;
+    state->pageId = -1;
+    state->spriteFontSprite = nullptr;
+
+    if (!font->isSpriteFont) {
+        int32_t fontTpagIndex = font->tpagIndex;
+        if (fontTpagIndex < 0) return false;
+        TexturePageItem* tpag;
+        int32_t pageId;
+        if (!resolveTpag(gx, fontTpagIndex, &tpag, &pageId)) return false;
+        state->fontTpagIndex = fontTpagIndex;
+        state->fontTpag = tpag;
+        state->pageId = pageId;
+    } else if (font->spriteIndex >= 0 && dw->sprt.count > (uint32_t)font->spriteIndex) {
+        state->spriteFontSprite = &dw->sprt.sprites[font->spriteIndex];
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool gxResolveGlyph(GxRendererImpl* gx, MAYBE_UNUSED DataWin* dw, GxFontState* state,
+                           FontGlyph* glyph, float cursorX, float cursorY,
+                           GxGlyphDraw* out) {
+    Font* font = state->font;
+    int32_t pageId;
+    int32_t sourceX, sourceY, sourceW, sourceH;
+
+    if (font->isSpriteFont && state->spriteFontSprite != nullptr) {
+        Sprite* sprite = state->spriteFontSprite;
+        int32_t glyphIndex = (int32_t)(glyph - font->glyphs);
+        if (glyphIndex < 0 || glyphIndex >= (int32_t)sprite->textureCount) return false;
+
+        int32_t tpagIdx = sprite->tpagIndices[glyphIndex];
+        TexturePageItem* glyphTpag;
+        if (!resolveTpag(gx, tpagIdx, &glyphTpag, &pageId)) return false;
+
+        sourceX = glyphTpag->sourceX;
+        sourceY = glyphTpag->sourceY;
+        sourceW = glyphTpag->sourceWidth;
+        sourceH = glyphTpag->sourceHeight;
+
+        out->localX0 = cursorX + (float)glyph->offset;
+        out->localY0 = cursorY + (float)(int32_t)glyphTpag->targetY - (float)font->spriteOriginYAdjust;
+    } else {
+        pageId = state->pageId;
+        sourceX = state->fontTpag->sourceX + glyph->sourceX;
+        sourceY = state->fontTpag->sourceY + glyph->sourceY;
+        sourceW = glyph->sourceWidth;
+        sourceH = glyph->sourceHeight;
+
+        out->localX0 = cursorX + (float)glyph->offset;
+        out->localY0 = cursorY;
+    }
+
+    out->pageId = pageId;
+    out->sourceX = sourceX;
+    out->sourceY = sourceY;
+    out->sourceW = sourceW;
+    out->sourceH = sourceH;
+    return true;
+}
+
+static void gxEmitGlyphQuad(GxRendererImpl* gx, const Matrix4f* localToEfb,
+                            const GxGlyphDraw* glyph, float glyphW, float glyphH,
+                            uint8_t r0, uint8_t g0, uint8_t b0,
+                            uint8_t r1, uint8_t g1, uint8_t b1,
+                            uint8_t r2, uint8_t g2, uint8_t b2,
+                            uint8_t r3, uint8_t g3, uint8_t b3,
+                            uint8_t a) {
+    float lx0 = glyph->localX0;
+    float ly0 = glyph->localY0;
+    float lx1 = lx0 + glyphW;
+    float ly1 = ly0 + glyphH;
+
+    float sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3;
+    TRANSFORM_CORNER(localToEfb, lx0, ly0, gx->portW, gx->portH, gx->portX, gx->portY, sx0, sy0);
+    TRANSFORM_CORNER(localToEfb, lx1, ly0, gx->portW, gx->portH, gx->portX, gx->portY, sx1, sy1);
+    TRANSFORM_CORNER(localToEfb, lx1, ly1, gx->portW, gx->portH, gx->portX, gx->portY, sx2, sy2);
+    TRANSFORM_CORNER(localToEfb, lx0, ly1, gx->portW, gx->portH, gx->portX, gx->portY, sx3, sy3);
+
+    // Glyph corner colors are usually uniform; use top-left for the shared emitter.
+    (void)r1; (void)g1; (void)b1; (void)r2; (void)g2; (void)b2; (void)r3; (void)g3; (void)b3;
+    emitTexturedAtlasRect(gx, glyph->pageId,
+        glyph->sourceX, glyph->sourceY, glyph->sourceW, glyph->sourceH,
+        sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3, r0, g0, b0, a);
+}
+
+static void gxDrawText(Renderer* renderer, const char* text,
+                       float x, float y, float xscale, float yscale,
+                       float angleDeg, float lineSeparation) {
+    if (text == nullptr || text[0] == '\0') return;
+
+    GxRendererImpl* gx = (GxRendererImpl*)renderer;
+    DataWin* dw = renderer->dataWin;
+    int32_t fontIndex = renderer->drawFont;
+    if (fontIndex < 0 || dw->font.count <= (uint32_t)fontIndex) return;
+
+    Font* font = &dw->font.fonts[fontIndex];
+    GxFontState fontState;
+    if (!gxResolveFontState(gx, dw, font, &fontState)) return;
+
+    uint32_t color = renderer->drawColor;
+    uint8_t r = BGR_R(color), g = BGR_G(color), b = BGR_B(color);
+    uint8_t a = alphaToU8(renderer->drawAlpha);
+
+    int32_t textLen = (int32_t)strlen(text);
+    int32_t lineCount = TextUtils_countLines(text, textLen);
+    float lineStride = (lineSeparation < 0.0f)
+        ? TextUtils_lineStride(font)
+        : (lineSeparation / (font->scaleY != 0.0f ? font->scaleY : 1.0f));
+
+    float totalHeight = (float)lineCount * lineStride;
+    float valignOffset = 0.0f;
+    if (renderer->drawValign == 1) valignOffset = -totalHeight / 2.0f;
+    else if (renderer->drawValign == 2) valignOffset = -totalHeight;
+
+    float angleRad = -angleDeg * ((float)M_PI / 180.0f);
+    Matrix4f textT;
+    Matrix4f_setTransform2D(&textT, x, y, xscale * font->scaleX, yscale * font->scaleY, angleRad);
+    Matrix4f localToEfb;
+    Matrix4f_multiply(&localToEfb, &gx->wvp, &textT);
+
+    float cursorY = valignOffset - (float)font->ascenderOffset;
+    int32_t lineStart = 0;
+
+    for (int32_t lineIdx = 0; lineIdx < lineCount; lineIdx++) {
+        int32_t lineEnd = lineStart;
+        while (lineEnd < textLen && !TextUtils_isNewlineChar(text[lineEnd])) lineEnd++;
+        int32_t lineLen = lineEnd - lineStart;
+
+        float lineWidth = TextUtils_measureLineWidth(font, text + lineStart, lineLen);
+        float halignOffset = 0.0f;
+        if (renderer->drawHalign == 1) halignOffset = -lineWidth / 2.0f;
+        else if (renderer->drawHalign == 2) halignOffset = -lineWidth;
+
+        float cursorX = halignOffset;
+        int32_t pos = 0;
+        uint16_t ch = 0;
+        bool hasCh = false;
+        if (pos < lineLen) {
+            ch = TextUtils_decodeUtf8(text + lineStart, lineLen, &pos);
+            hasCh = true;
+        }
+
+        while (hasCh) {
+            FontGlyph* glyph = TextUtils_findGlyph(font, ch);
+            uint16_t nextCh = 0;
+            bool hasNext = pos < lineLen;
+            if (hasNext) nextCh = TextUtils_decodeUtf8(text + lineStart, lineLen, &pos);
+
+            if (glyph != nullptr) {
+                bool drew = false;
+                if (glyph->sourceWidth != 0 && glyph->sourceHeight != 0) {
+                    GxGlyphDraw gd;
+                    if (gxResolveGlyph(gx, dw, &fontState, glyph, cursorX, cursorY, &gd)) {
+                        gxEmitGlyphQuad(gx, &localToEfb, &gd,
+                                        (float)glyph->sourceWidth, (float)glyph->sourceHeight,
+                                        r, g, b, r, g, b, r, g, b, r, g, b, a);
+                        drew = true;
+                    }
+                }
+                cursorX += (float)glyph->shift;
+                if (drew && hasNext) cursorX += TextUtils_getKerningOffset(glyph, nextCh);
+            }
+
+            ch = nextCh;
+            hasCh = hasNext;
+        }
+
+        cursorY += lineStride;
+        if (lineEnd < textLen) lineStart = TextUtils_skipNewline(text, lineEnd, textLen);
+        else lineStart = lineEnd;
+    }
+}
+
+static void gxDrawTextColor(Renderer* renderer, const char* text,
+                            float x, float y, float xscale, float yscale,
+                            float angleDeg,
+                            int32_t _c1, int32_t _c2, int32_t _c3, int32_t _c4,
+                            float alpha, float lineSeparation) {
+    if (text == nullptr || text[0] == '\0') return;
+
+    GxRendererImpl* gx = (GxRendererImpl*)renderer;
+    DataWin* dw = renderer->dataWin;
+    int32_t fontIndex = renderer->drawFont;
+    if (fontIndex < 0 || dw->font.count <= (uint32_t)fontIndex) return;
+
+    Font* font = &dw->font.fonts[fontIndex];
+    GxFontState fontState;
+    if (!gxResolveFontState(gx, dw, font, &fontState)) return;
+
+    uint8_t a = alphaToU8(alpha);
+    int32_t textLen = (int32_t)strlen(text);
+    int32_t lineCount = TextUtils_countLines(text, textLen);
+    float lineStride = (lineSeparation < 0.0f)
+        ? TextUtils_lineStride(font)
+        : (lineSeparation / (font->scaleY != 0.0f ? font->scaleY : 1.0f));
+
+    float totalHeight = (float)lineCount * lineStride;
+    float valignOffset = 0.0f;
+    if (renderer->drawValign == 1) valignOffset = -totalHeight / 2.0f;
+    else if (renderer->drawValign == 2) valignOffset = -totalHeight;
+
+    float angleRad = -angleDeg * ((float)M_PI / 180.0f);
+    Matrix4f textT;
+    Matrix4f_setTransform2D(&textT, x, y, xscale * font->scaleX, yscale * font->scaleY, angleRad);
+    Matrix4f localToEfb;
+    Matrix4f_multiply(&localToEfb, &gx->wvp, &textT);
+
+    float cursorY = valignOffset - (float)font->ascenderOffset;
+    int32_t lineStart = 0;
+
+    for (int32_t lineIdx = 0; lineIdx < lineCount; lineIdx++) {
+        int32_t lineEnd = lineStart;
+        while (lineEnd < textLen && !TextUtils_isNewlineChar(text[lineEnd])) lineEnd++;
+        int32_t lineLen = lineEnd - lineStart;
+
+        float lineWidth = TextUtils_measureLineWidth(font, text + lineStart, lineLen);
+        float halignOffset = 0.0f;
+        if (renderer->drawHalign == 1) halignOffset = -lineWidth / 2.0f;
+        else if (renderer->drawHalign == 2) halignOffset = -lineWidth;
+
+        float cursorX = halignOffset;
+        float gradientX = 0.0f;
+        int32_t pos = 0;
+        uint16_t ch = 0;
+        bool hasCh = false;
+        if (pos < lineLen) {
+            ch = TextUtils_decodeUtf8(text + lineStart, lineLen, &pos);
+            hasCh = true;
+        }
+
+        while (hasCh) {
+            FontGlyph* glyph = TextUtils_findGlyph(font, ch);
+            uint16_t nextCh = 0;
+            bool hasNext = pos < lineLen;
+            if (hasNext) nextCh = TextUtils_decodeUtf8(text + lineStart, lineLen, &pos);
+
+            if (glyph != nullptr) {
+                float advance = (float)glyph->shift;
+                float leftFrac = (lineWidth > 0.0f) ? (gradientX / lineWidth) : 0.0f;
+                float rightFrac = (lineWidth > 0.0f) ? ((gradientX + advance) / lineWidth) : 1.0f;
+                int32_t c1 = Color_lerp(_c1, _c2, leftFrac);
+                int32_t c2 = Color_lerp(_c1, _c2, rightFrac);
+                int32_t c3 = Color_lerp(_c4, _c3, rightFrac);
+                int32_t c4 = Color_lerp(_c4, _c3, leftFrac);
+
+                bool drew = false;
+                if (glyph->sourceWidth != 0 && glyph->sourceHeight != 0) {
+                    GxGlyphDraw gd;
+                    if (gxResolveGlyph(gx, dw, &fontState, glyph, cursorX, cursorY, &gd)) {
+                        gxEmitGlyphQuad(gx, &localToEfb, &gd,
+                                        (float)glyph->sourceWidth, (float)glyph->sourceHeight,
+                                        BGR_R(c1), BGR_G(c1), BGR_B(c1),
+                                        BGR_R(c2), BGR_G(c2), BGR_B(c2),
+                                        BGR_R(c3), BGR_G(c3), BGR_B(c3),
+                                        BGR_R(c4), BGR_G(c4), BGR_B(c4),
+                                        a);
+                        drew = true;
+                    }
+                }
+
+                cursorX += advance;
+                gradientX += advance;
+                if (drew && hasNext) {
+                    float kern = TextUtils_getKerningOffset(glyph, nextCh);
+                    cursorX += kern;
+                    gradientX += kern;
+                }
+            }
+
+            ch = nextCh;
+            hasCh = hasNext;
+        }
+
+        cursorY += lineStride;
+        if (lineEnd < textLen) lineStart = TextUtils_skipNewline(text, lineEnd, textLen);
+        else lineStart = lineEnd;
+    }
+}
 
 static void gxFlush(MAYBE_UNUSED Renderer* renderer) {}
+
 
 // ===[ Vtable: blend / GPU state ]===
 
@@ -1203,12 +1852,15 @@ static bool gxTextureGetUVs(Renderer* renderer, uint32_t texID, float* outUVs) {
     int16_t pageId = tpag->texturePageId;
     if (pageId < 0 || (uint32_t)pageId >= gx->textureCount) return false;
     if (!gx->texW[pageId] || !gx->texH[pageId]) return false;
+    int32_t mx, my, mw, mh;
+    mapAtlasRect(gx, pageId, tpag->sourceX, tpag->sourceY, tpag->sourceWidth, tpag->sourceHeight,
+                 &mx, &my, &mw, &mh);
     float tw = (float)gx->texW[pageId];
     float th = (float)gx->texH[pageId];
-    outUVs[0] = (float)tpag->sourceX / tw;
-    outUVs[1] = (float)tpag->sourceY / th;
-    outUVs[2] = (float)(tpag->sourceX + tpag->sourceWidth)  / tw;
-    outUVs[3] = (float)(tpag->sourceY + tpag->sourceHeight) / th;
+    outUVs[0] = (float)mx / tw;
+    outUVs[1] = (float)my / th;
+    outUVs[2] = (float)(mx + mw) / tw;
+    outUVs[3] = (float)(my + mh) / th;
     return true;
 }
 
@@ -1340,4 +1992,27 @@ void GxRenderer_present(Renderer* renderer) {
     VIDEO_Flush();
     VIDEO_WaitVSync();
     *gx->fbIndex ^= 1;
+}
+
+void GxRenderer_queryTextureStats(Renderer* renderer, GxTextureStats* out) {
+    if (!out) return;
+    out->totalPages = 0;
+    out->loadedPages = 0;
+    out->residentBytes = 0;
+    if (!renderer) return;
+
+    GxRendererImpl* gx = (GxRendererImpl*)renderer;
+    out->totalPages = gx->textureCount;
+    for (uint32_t i = 0; i < gx->textureCount; i++) {
+        if (!gx->texLoaded || !gx->texLoaded[i]) continue;
+        if (!gx->texW || gx->texW[i] == 0) continue;
+        out->loadedPages++;
+        if (!gx->texSlices || !gx->texSliceCounts) continue;
+        for (int32_t s = 0; s < gx->texSliceCounts[i]; s++) {
+            GxTextureSlice* slice = &gx->texSlices[i][s];
+            if (slice->data) {
+                out->residentBytes += (uint64_t)gx->texW[i] * (uint64_t)slice->height * 4ull;
+            }
+        }
+    }
 }
