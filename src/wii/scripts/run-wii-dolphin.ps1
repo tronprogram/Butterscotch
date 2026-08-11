@@ -9,7 +9,7 @@ if (-not (Test-Path $dolphin)) {
     exit 1
 }
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
 
 if ($Dol -eq "") {
     $bootDol = "$repoRoot\build-wii\apps\butterscotch\boot.dol"

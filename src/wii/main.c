@@ -20,6 +20,8 @@
 #include "gx_renderer.h"
 #include "noop_audio_system.h"
 #include "wii_overlay.h"
+#include "wii_boot_menu.h"
+#include "wii_settings.h"
 #include "../utils.h"
 #include "../gettime.h"
 
@@ -29,7 +31,7 @@
 
 #define GX_FIFO_SIZE (256 * 1024)
 
-// Button to GML key mapping
+// Button to GML key mapping (live table; seeded from WiiPortSettings / CONFIG.JSN)
 typedef struct {
     uint32_t wpadButton;
     int32_t  gmlKey;
@@ -37,8 +39,50 @@ typedef struct {
 
 static WiiMapping* wiiMappings  = NULL;
 static int         wiiMappingCount = 0;
+static WiiMapping  wiiMappingsOwned[WII_SETTINGS_MAP_MAX];
 
 static uint32_t prevHeld = 0;
+
+static GXRModeObj* gRmode = NULL;
+static void* gXfb0 = NULL;
+static void* gXfb1 = NULL;
+static u32* gFbIndex = NULL;
+static const char* gBundleDir = NULL;
+static WiiPortSettings gPortSettings;
+static AudioSystem* gAudioSystem = NULL;
+
+static void installDefaultMappings(void);
+
+static void applyPortMappings(const WiiPortSettings* s) {
+    int n = s->mapCount;
+    if (n > WII_SETTINGS_MAP_MAX) n = WII_SETTINGS_MAP_MAX;
+    if (n <= 0) {
+        installDefaultMappings();
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        wiiMappingsOwned[i].wpadButton = s->maps[i].wpadButton;
+        wiiMappingsOwned[i].gmlKey = s->maps[i].gmlKey;
+    }
+    wiiMappings = wiiMappingsOwned;
+    wiiMappingCount = n;
+}
+
+static void applyAudioGain(void) {
+    if (!gAudioSystem || !gAudioSystem->vtable || !gAudioSystem->vtable->setMasterGain) return;
+    gAudioSystem->vtable->setMasterGain(gAudioSystem, gPortSettings.masterGain);
+}
+
+static int32_t findRoomIndexByName(DataWin* dw, const char* name) {
+    if (!dw || !name || !name[0]) return -1;
+    for (uint32_t i = 0; i < dw->room.count; i++) {
+        Room* room = &dw->room.rooms[i];
+        if (room->present && room->name && strcmp(room->name, name) == 0) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
 
 void platformLog(const logType type, const char* format, va_list va) {
     FILE* out = stderr;
@@ -84,13 +128,62 @@ static void installDefaultMappings(void) {
     wiiMappingCount = (int)(sizeof(defaults) / sizeof(defaults[0]));
 }
 
+// Soft return to the Wii Channels / System Menu (not HBC, not a cold reboot).
+static void returnToWiiMenu(void) {
+    logInfo("Returning to Wii System Menu...\n");
+    VIDEO_SetBlack(TRUE);
+    VIDEO_Flush();
+    VIDEO_WaitVSync();
+    SYS_ResetSystem(SYS_RETURNTOMENU, 0, 0);
+    // SYS_ResetSystem does not return on hardware; keep a fallback for odd hosts.
+    while (1) {}
+}
+
 static void pollWpad(Runner* runner) {
     WPAD_ScanPads();
     uint32_t held = WPAD_ButtonsHeld(0);
     uint32_t down = WPAD_ButtonsDown(0);
 
     if (down & WPAD_BUTTON_HOME) {
-        WiiOverlay_toggleDebugOverlay(runner);
+        if (gAudioSystem && gAudioSystem->vtable && gAudioSystem->vtable->pauseAll) {
+            gAudioSystem->vtable->pauseAll(gAudioSystem);
+        }
+
+        bool exitLoader = false;
+        bool softReset = WiiSystemMenu_run(
+            gRmode, gXfb0, gXfb1, gFbIndex, gBundleDir, &gPortSettings, runner, &exitLoader);
+        applyPortMappings(&gPortSettings);
+        applyAudioGain();
+        WiiOverlay_setDebugOverlayState((WiiDebugOverlayState)gPortSettings.debugOverlay, runner);
+        // Drop held keys so a held A from the menu doesn't leak into GML.
+        prevHeld = 0;
+        if (runner->keyboard) {
+            for (int k = 0; k < GML_KEY_COUNT; k++) {
+                if (runner->keyboard->keyDown[k]) {
+                    RunnerKeyboard_onKeyUp(runner->keyboard, k);
+                }
+            }
+        }
+
+        if (exitLoader) {
+            if (gAudioSystem && gAudioSystem->vtable && gAudioSystem->vtable->stopAll) {
+                gAudioSystem->vtable->stopAll(gAudioSystem);
+            }
+            returnToWiiMenu();
+            return;
+        }
+        if (softReset) {
+            if (gAudioSystem && gAudioSystem->vtable && gAudioSystem->vtable->stopAll) {
+                gAudioSystem->vtable->stopAll(gAudioSystem);
+            }
+            runner->pendingRoom = ROOM_RESTARTGAME;
+            return;
+        }
+
+        if (gAudioSystem && gAudioSystem->vtable && gAudioSystem->vtable->resumeAll) {
+            gAudioSystem->vtable->resumeAll(gAudioSystem);
+        }
+        return;
     }
 
     repeat(wiiMappingCount, i) {
@@ -185,6 +278,24 @@ int main(int argc, char* argv[]) {
     }
     logInfo("Found data.win at %s\n", dataWinPath);
 
+    // ===[ Port settings + pre-boot shell ]===
+    u32 fbIndex = 0;
+    gRmode = rmode;
+    gXfb0 = xfb0;
+    gXfb1 = xfb1;
+    gFbIndex = &fbIndex;
+    gBundleDir = bundleDir;
+    WiiSettings_load(&gPortSettings, bundleDir);
+    {
+        char saveDir[128];
+        snprintf(saveDir, sizeof(saveDir), "%ssaves/", bundleDir);
+        mkdir(saveDir, 0755);
+    }
+    if (WiiBootMenu_run(rmode, xfb0, xfb1, &fbIndex, bundleDir, &gPortSettings) == WII_BOOT_RETURN_TO_MENU) {
+        returnToWiiMenu();
+    }
+    applyPortMappings(&gPortSettings);
+
     // ===[ Load CONFIG.JSN (optional) ]===
     char configPath[128];
     snprintf(configPath, sizeof(configPath), "%sCONFIG.JSN", bundleDir);
@@ -222,6 +333,7 @@ int main(int argc, char* argv[]) {
 
         disabledObjectsArr = JsonReader_getJsonValueByKey(configRoot, "disabledObjects");
 
+        // CONFIG.JSN mappings override port settings only if explicitly present.
         JsonValue* mapsObj = JsonReader_getJsonValueByKey(configRoot, "controller1Mappings");
         if (mapsObj != NULL && JsonReader_isObject(mapsObj)) {
             parseWiiMappings(configRoot, "controller1Mappings");
@@ -229,7 +341,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (wiiMappingCount == 0) {
-        installDefaultMappings();
+        applyPortMappings(&gPortSettings);
     }
 
     // ===[ Parse data.win ]===
@@ -281,7 +393,6 @@ int main(int argc, char* argv[]) {
 
     // ===[ Renderer ]===
     logInfo("Creating renderer...\n");
-    u32 fbIndex = 0;
     Renderer* renderer = GxRenderer_create(rmode, xfb0, xfb1, &fbIndex);
 
     // ===[ Audio ]===
@@ -292,6 +403,8 @@ int main(int argc, char* argv[]) {
 #else
     AudioSystem* audioSystem = (AudioSystem*)NoopAudioSystem_create();
 #endif
+    gAudioSystem = audioSystem;
+    applyAudioGain();
 
     // ===[ Runner ]===
     logInfo("Creating runner...\n");
@@ -311,11 +424,21 @@ int main(int argc, char* argv[]) {
     }
 
     // ===[ WPAD ]===
-    WPAD_Init();
+    // Boot menu already called WPAD_Init(); safe to call again.
 
     // ===[ First Room ]===
     logInfo("Initializing first room...\n");
     Runner_initFirstRoom(runner);
+    if (gPortSettings.startRoomName[0]) {
+        int32_t roomIdx = findRoomIndexByName(dataWin, gPortSettings.startRoomName);
+        if (roomIdx >= 0) {
+            logInfo("Extras: jumping to room %s (index %d)\n", gPortSettings.startRoomName, roomIdx);
+            runner->pendingRoom = roomIdx;
+            Runner_handlePendingRoomChange(runner);
+        } else {
+            logWarn("Extras: start room '%s' not found; using normal boot\n", gPortSettings.startRoomName);
+        }
+    }
 
     Gen8* gen8 = &dataWin->gen8;
     int32_t gameW = (int32_t)gen8->defaultWindowWidth;
@@ -326,6 +449,7 @@ int main(int argc, char* argv[]) {
     logInfo("Entering main loop (%dx%d game, %dx%d display)\n", gameW, gameH, winW, winH);
 
     WiiOverlay_init();
+    WiiOverlay_setDebugOverlayState((WiiDebugOverlayState)gPortSettings.debugOverlay, runner);
 
     uint64_t lastTime = nowNanos();
     float lastPresentMs = 0.0f;
@@ -431,10 +555,13 @@ int main(int argc, char* argv[]) {
         displayParity++;
     }
 
+    // Undertale's Hold-ESC path calls game_end → shouldExit. A bare return from
+    // main in a Wii DOL hard-crashes Dolphin and can PPC-halt on hardware.
+    // Treat in-game quit the same as the boot/system menu "Return to Wii Menu".
+    if (gAudioSystem && gAudioSystem->vtable && gAudioSystem->vtable->stopAll) {
+        gAudioSystem->vtable->stopAll(gAudioSystem);
+    }
     WiiOverlay_deinit();
-    audioSystem->vtable->destroy(audioSystem);
-    renderer->vtable->destroy(renderer);
-    DataWin_free(dataWin);
-
+    returnToWiiMenu();
     return 0;
 }

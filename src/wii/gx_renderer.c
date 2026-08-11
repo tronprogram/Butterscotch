@@ -311,7 +311,7 @@ static bool peekPngSize(const uint8_t* blob, size_t blobSize, int* outW, int* ou
     return true;
 }
 
-// WTL1: offline-tiled atlas (see scripts/repack-wii-face-atlases.py).
+// WTL1: offline-tiled atlas (see src/wii/scripts/repack-wii-face-atlases.py).
 // magic "WTL1" + u32 width,height,tileH,tileCount + tileCount×(u32 offset,u32 size) + PNG tiles.
 static bool peekWtl1Size(const uint8_t* blob, size_t blobSize, int* outW, int* outH, uint32_t* outTileCount) {
     if (blobSize < 20) return false;

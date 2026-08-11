@@ -653,15 +653,54 @@ static void wiiPauseAll(AudioSystem* audio) {
     WiiAudioSystem* sys = (WiiAudioSystem*)audio;
     sys->suspended = true;
     AESND_Pause(true);
+
+    // Drop any queued stream PCM so resume doesn't blast stale buffers that
+    // piled up while the system menu held the main loop (no audio update).
+    for (int i = 0; i < WII_MAX_VOICES; i++) {
+        VoiceSlot* slot = &sys->voices[i];
+        if (!slot->active || !slot->streaming) continue;
+        for (int b = 0; b < 2; b++) {
+            if (!slot->streamBuf[b]) continue;
+            uint32_t bytes = slot->streamBufBytes[b];
+            if (bytes == 0) bytes = (uint32_t)WII_STREAM_FRAMES * (uint32_t)slot->channels * sizeof(int16_t);
+            memset(slot->streamBuf[b], 0, bytes);
+            flushPcm(slot->streamBuf[b], bytes);
+            slot->streamBufBytes[b] = bytes;
+            slot->needRefill[b] = true;
+        }
+        slot->readyBuf = -1;
+        if (slot->voice && slot->streamBuf[slot->playBuf]) {
+            AESND_SetVoiceBuffer(slot->voice, slot->streamBuf[slot->playBuf],
+                                 slot->streamBufBytes[slot->playBuf]);
+        }
+    }
 }
 
 static void wiiResumeAll(AudioSystem* audio) {
     WiiAudioSystem* sys = (WiiAudioSystem*)audio;
     sys->suspended = false;
-    AESND_Pause(false);
+    // Refill stream buffers before unpausing AESND so the first callback
+    // after resume has fresh PCM instead of the silence we parked.
     for (int i = 0; i < WII_MAX_VOICES; i++) {
-        if (sys->voices[i].active) applyVoiceVolume(sys, &sys->voices[i]);
+        VoiceSlot* slot = &sys->voices[i];
+        if (!slot->active || !slot->streaming || slot->paused) continue;
+        for (int b = 0; b < 2; b++) {
+            if (slot->needRefill[b] || slot->streamBufBytes[b] == 0) {
+                fillStreamBuffer(slot, b);
+                slot->needRefill[b] = false;
+            }
+        }
+        if (slot->readyBuf < 0) {
+            int other = 1 - slot->playBuf;
+            if (slot->streamBufBytes[other] > 0) slot->readyBuf = other;
+        }
+        if (slot->voice && slot->streamBuf[slot->playBuf] && slot->streamBufBytes[slot->playBuf] > 0) {
+            AESND_SetVoiceBuffer(slot->voice, slot->streamBuf[slot->playBuf],
+                                 slot->streamBufBytes[slot->playBuf]);
+        }
+        applyVoiceVolume(sys, slot);
     }
+    AESND_Pause(false);
 }
 
 static void wiiSetSoundGain(AudioSystem* audio, int32_t soundOrInstance, float gain, MAYBE_UNUSED uint32_t timeMs) {

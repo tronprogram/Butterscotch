@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-"""Repack wide face/battle atlases for Wii at full sprite resolution.
+"""Repack wide TXTR atlases for Wii at full sprite resolution (WTL1).
 
 Problem:
-  TXTR pages 23/25 are 2048² (~16MB RGBA decode peak) and fail under Wii heap
-  pressure. A flat offline ÷2 makes dialog faces and battle sprites crunchy.
+  Any 2048-wide / 2048² TXTR (~8–16MB RGBA decode peak) OOMs or thrash on Wii.
+  A flat offline ÷2 keeps GX happy but makes Asriel/FloweyX/faces/props crunchy.
 
 Solution:
-  Rebuild those pages as **1024 × tall** atlases at **1:1**, stored as **WTL1**
-  (tiled PNGs). The GX loader decodes one ≤1024-tall tile at a time (~4MB peak)
-  and vertical-slices for drawing — full-res Toriel/Flowey faces without OOM.
+  Rebuild every originally-wide page as a **1024 × tall** atlas at **1:1**,
+  stored as **WTL1** (tiled PNGs). The GX loader decodes one ≤1024-tall tile at
+  a time (~4MB peak) and vertical-slices for drawing.
+
+Default pages (all pristine width>1024): 1, 11, 14, 20, 23, 25
+  - 1:  Asriel god-form / hyperdeath (+ afinal)
+  - 11: Waterfall/Hotland props
+  - 14: Omega Flowey (floweyx_*)
+  - 20: JP font preload
+  - 23/25: dialog faces + battle sprites
 
 Usage:
-  ./scripts/build-wii-data-win.sh
+  ./src/wii/scripts/build-wii-data-win.sh
 """
 from __future__ import annotations
 
@@ -97,6 +104,71 @@ def save_wtl1(img: Image.Image, tile_h: int = WTL1_TILE_H) -> bytes:
         payload += png
 
     return WTL1_MAGIC + struct.pack("<IIII", w, h, tile_h, len(tiles_png)) + bytes(index) + bytes(payload)
+
+
+def rewrite_txtr_blobs(data: bytearray, new_blobs: dict[int, bytes]) -> int:
+    """Replace TXTR page blobs; grow/shrink the TXTR chunk and shift AUDO if needed.
+
+    Undertale 1.0 derives each page's blobSize from successive absolute blobOffsets
+    (last page → end of TXTR). Dense 1:1 WTL1 packs can exceed the pristine PNG
+    slot (notably Omega Flowey page 14) — grow the chunk rather than ÷2 sprites.
+
+    Returns net byte delta applied to the file (AUDO shift).
+    """
+    if not new_blobs:
+        return 0
+
+    txtr_hdr, txtr_base, txtr_size = find_chunk(data, b"TXTR")
+    textures = txtr_textures(data)
+    count = len(textures)
+    first_blob = textures[0]["blob"]
+    old_end = txtr_base + txtr_size  # absolute offset of next chunk (AUDO)
+
+    rebuilt: list[bytes] = []
+    for i, tex in enumerate(textures):
+        if i in new_blobs:
+            rebuilt.append(new_blobs[i])
+        else:
+            rebuilt.append(bytes(data[tex["blob"] : tex["blob"] + tex["size"]]))
+
+    payload = bytearray()
+    offsets: list[int] = []
+    for blob in rebuilt:
+        while len(payload) % 4:
+            payload += b"\x00"
+        offsets.append(first_blob + len(payload))
+        payload += blob
+
+    new_end = first_blob + len(payload)
+    delta = new_end - old_end
+
+    if delta > 0:
+        data[old_end:old_end] = b"\x00" * delta
+    elif delta < 0:
+        del data[new_end:old_end]
+
+    data[first_blob : first_blob + len(payload)] = payload
+    struct.pack_into("<I", data, txtr_hdr + 4, new_end - txtr_base)
+    # Undertale 1.0 TXTR entry: u32 scaled, u32 blobOffset
+    for i, tex in enumerate(textures):
+        struct.pack_into("<I", data, tex["entry"] + 4, offsets[i])
+
+    if delta != 0:
+        audo_hdr = new_end
+        if data[audo_hdr : audo_hdr + 4] != b"AUDO":
+            raise SystemExit(
+                f"expected AUDO after TXTR at {audo_hdr}, found {data[audo_hdr:audo_hdr+4]!r}"
+            )
+        audo_base = audo_hdr + 8
+        audo_count = u32(data, audo_base)
+        for i in range(audo_count):
+            poff = audo_base + 4 + i * 4
+            ptr = u32(data, poff)
+            if ptr != 0:
+                struct.pack_into("<I", data, poff, ptr + delta)
+
+    struct.pack_into("<I", data, 4, len(data) - 8)
+    return delta
 
 
 def shelf_pack(
@@ -189,19 +261,21 @@ def repack_page(
     page_id: int,
     max_w: int,
     max_h: int,
-) -> None:
-    textures = txtr_textures(data)
+) -> bytes | None:
+    """Rebuild one TXTR page at 1:1 (WTL1 if tall). Patches TPAG UVs; returns new blob.
+
+    Caller must install the blob via rewrite_txtr_blobs (supports slot growth).
+    """
     otex = txtr_textures(orig)
-    blob = textures[page_id]["blob"]
-    slot = textures[page_id]["size"]
+    old_slot = otex[page_id]["size"]
     src_img = load_png_from_slot(orig, otex[page_id]["blob"], otex[page_id]["size"])
     uniq = collect_unique_rects(orig, page_id)
     if not uniq:
         print(f"page {page_id}: no TPAG rects, skip")
-        return
+        return None
 
-    # Prefer full 1:1 into a tall 1024×N atlas (vertical GX slices). Only degrade
-    # if pack height or PNG slot forces it — battle/finale sprites stay sharp.
+    # Prefer full 1:1 into a tall 1024×N atlas. Only degrade if shelf_pack cannot
+    # fit under max_h — blob overflow is handled by rewrite_txtr_blobs growth.
     attempts: list[tuple[str, int, int, int, int]] = [
         # label, face_max (-1=all 1:1), med_max, large_scale, pad
         ("1:1 tall", -1, 0, 1, 1),
@@ -247,20 +321,13 @@ def repack_page(
         else:
             blob_bytes = save_png(atlas)
             enc = "PNG"
-        if len(blob_bytes) > slot:
-            last_err = f"{enc} {len(blob_bytes)} > slot {slot}"
-            places = None
-            continue
 
-        png = blob_bytes  # stored into TXTR slot below
+        png = blob_bytes
         mode = f"{label}/{enc}"
         break
 
     if places is None:
         raise SystemExit(f"page {page_id}: cannot pack: {last_err}")
-
-    data[blob : blob + slot] = b"\x00" * slot
-    data[blob : blob + len(png)] = png
 
     _, otbase, _ = find_chunk(orig, b"TPAG")
     _, ctbase, _ = find_chunk(data, b"TPAG")
@@ -293,12 +360,16 @@ def repack_page(
         by_scale[s] = by_scale.get(s, 0) + 1
     scale_txt = ", ".join(f"1:{s}={n}" for s, n in sorted(by_scale.items()))
     slices = (ah + 1023) // 1024
+    grow = ""
+    if len(png) > old_slot:
+        grow = f", grow +{len(png) - old_slot}"
     print(
         f"page {page_id}: {src_img.size} -> {aw}x{ah} ({slices} GX slices), "
         f"mode={mode!r}, {len(uniq)} unique ({scale_txt}), "
-        f"blob {len(png)}/{slot}, patched {patched} "
+        f"blob {len(png)}/{old_slot}{grow}, patched {patched} "
         f"(1:1 refs {face_n}, scaled refs {large_n})"
     )
+    return png
 
 
 def main() -> int:
@@ -313,13 +384,18 @@ def main() -> int:
         default=None,
         help="optional already-preprocessed data.win to keep other page edits; default=input",
     )
-    ap.add_argument("--pages", type=str, default="23,25")
+    ap.add_argument(
+        "--pages",
+        type=str,
+        default="1,11,14,20,23,25",
+        help="TXTR page ids to 1:1-repack as tall/WTL1 (comma-separated)",
+    )
     ap.add_argument("--max-w", type=int, default=1024, help="GX texture width cap")
     ap.add_argument(
         "--max-h",
         type=int,
-        default=4096,
-        help="atlas height cap (renderer vertical-slices every 1024)",
+        default=8192,
+        help="atlas height cap (renderer vertical-slices every 1024; WTL1 tiles amortize decode)",
     )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
@@ -338,12 +414,21 @@ def main() -> int:
             raise SystemExit(f"page {p} slot mismatch orig vs base")
         data[cb : cb + csz] = orig[ob : ob + osz]
 
+    new_blobs: dict[int, bytes] = {}
     for p in pages:
-        repack_page(data, orig, p, args.max_w, args.max_h)
+        blob = repack_page(data, orig, p, args.max_w, args.max_h)
+        if blob is not None:
+            new_blobs[p] = blob
 
     if args.dry_run:
-        print("dry-run: no file written")
+        need = sum(max(0, len(b) - otex[p]["size"]) for p, b in new_blobs.items())
+        print(f"dry-run: no file written (would grow TXTR by ~{need} bytes if tight)")
         return 0
+
+    delta = rewrite_txtr_blobs(data, new_blobs)
+    if delta:
+        print(f"TXTR/AUDO shift: {delta:+d} bytes (FORM now {len(data)})")
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(data)
     print(f"wrote {args.output}")

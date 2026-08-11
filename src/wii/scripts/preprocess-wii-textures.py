@@ -7,7 +7,7 @@ downscale (peak RAM ~16MB for 2048²). This tool bakes a nearest-neighbor
 Wii loader treats them like normal ≤1024-wide pages.
 
 Usage:
-  tools/.venv-wii-tex/bin/python scripts/preprocess-wii-textures.py \\
+  tools/.venv-wii-tex/bin/python src/wii/scripts/preprocess-wii-textures.py \\
       build-wii/apps/butterscotch/data.win \\
       -o build-wii/apps/butterscotch/data.win
 """
@@ -131,8 +131,8 @@ def main() -> int:
     ap.add_argument(
         "--exclude",
         type=str,
-        default="23,25",
-        help="comma-separated page ids to leave full-res (default: 23,25 dialog face atlases)",
+        default="1,11,14,20,23,25",
+        help="comma-separated page ids to leave full-res for WTL1 repack (default: all wide pages)",
     )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()

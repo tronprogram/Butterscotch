@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 APP_DIR="${REPO_ROOT}/build-wii/apps/butterscotch"
 USERDIR="${DOLPHIN_USER:-${REPO_ROOT}/.dolphin-user}"
 SYNC="${USERDIR}/Load/WiiSDSync"
@@ -16,7 +16,7 @@ if [[ -z "${DOL}" ]]; then
   elif [[ -f "${REPO_ROOT}/build-wii/butterscotch.dol" ]]; then
     DOL="${REPO_ROOT}/build-wii/butterscotch.dol"
   else
-    echo "No .dol found. Build first with scripts/build-wii-docker.sh" >&2
+    echo "No .dol found. Build first with src/wii/scripts/build-wii-docker.sh" >&2
     exit 1
   fi
 fi
@@ -27,8 +27,8 @@ if [[ ! -f "${APP_DIR}/data.win" ]]; then
   exit 1
 fi
 
-if [[ -f "${REPO_ROOT}/scripts/validate-wii-dol.py" ]]; then
-  python3 "${REPO_ROOT}/scripts/validate-wii-dol.py" "${DOL}"
+if [[ -f "${SCRIPT_DIR}/validate-wii-dol.py" ]]; then
+  python3 "${SCRIPT_DIR}/validate-wii-dol.py" "${DOL}"
 fi
 
 mkdir -p "${SYNC}/apps/butterscotch" "${USERDIR}/Config"

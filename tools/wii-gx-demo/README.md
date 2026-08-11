@@ -35,8 +35,8 @@ Use this to decide whether slowdowns / missing draws are:
 ## Build / run
 
 ```bash
-./scripts/build-wii-gx-demo-docker.sh
-./scripts/run-wii-gx-demo.sh
+./src/wii/scripts/build-wii-gx-demo-docker.sh
+./src/wii/scripts/run-wii-gx-demo.sh
 ```
 
 Output DOL: `build-wii-gx-demo/boot.dol`

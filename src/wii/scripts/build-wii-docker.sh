@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 IMAGE="${DKP_IMAGE:-devkitpro/devkitppc:latest}"
 PLATFORM="${DKP_PLATFORM:-}"
@@ -42,4 +42,4 @@ docker run --rm \
   -e DEVKITPRO=/opt/devkitpro \
   -e DEVKITPPC=/opt/devkitpro/devkitPPC \
   "${IMAGE}" \
-  bash -lc 'bash ./scripts/build-wii.sh'
+  bash -lc 'bash ./src/wii/scripts/build-wii.sh'

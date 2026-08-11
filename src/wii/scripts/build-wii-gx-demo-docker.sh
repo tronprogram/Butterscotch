@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 DEMO_DIR="${REPO_ROOT}/tools/wii-gx-demo"
 OUT_DIR="${REPO_ROOT}/build-wii-gx-demo"
 
@@ -69,8 +69,8 @@ cp -f "${DEMO_DIR}/boot.elf" "${OUT_DIR}/boot.elf" 2>/dev/null || true
 
 # Stock elf2dol emits unaligned section sizes; modern Dolphin rejects those
 # with "Failed to init core" / "No se ha podido iniciar el núcleo".
-python3 "${REPO_ROOT}/scripts/pad-wii-dol.py" "${OUT_DIR}/boot.dol"
-python3 "${REPO_ROOT}/scripts/validate-wii-dol.py" "${OUT_DIR}/boot.dol"
+python3 "${SCRIPT_DIR}/pad-wii-dol.py" "${OUT_DIR}/boot.dol"
+python3 "${SCRIPT_DIR}/validate-wii-dol.py" "${OUT_DIR}/boot.dol"
 cp -f "${OUT_DIR}/boot.dol" "${DEMO_DIR}/boot.dol"
 
 # Minimal HBC-style folder for SD sync (no data.win needed).
@@ -89,4 +89,4 @@ XML
 
 echo ""
 echo "Demo DOL: ${OUT_DIR}/boot.dol"
-echo "Run with: ./scripts/run-wii-gx-demo.sh"
+echo "Run with: ./src/wii/scripts/run-wii-gx-demo.sh"

@@ -10,7 +10,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 APP_DIR="${REPO_ROOT}/build-wii/apps/butterscotch"
 COMPARE_DIR="${REPO_ROOT}/build-wii-compare"
 DOLPHIN_BIN="/Applications/Dolphin.app/Contents/MacOS/Dolphin"

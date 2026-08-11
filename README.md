@@ -18,32 +18,32 @@
 Requires [devkitPro](https://devkitpro.org/) (`wii-dev`) and MSYS2 `cmake`.
 
 ```powershell
-.\scripts\setup-wii-deps.sh   # once, from MSYS2
-.\scripts\build-wii.ps1
-.\scripts\run-wii-dolphin.ps1
+.\src\wii\scripts\setup-wii-deps.sh   # once, from MSYS2
+.\src\wii\scripts\build-wii.ps1
+.\src\wii\scripts\run-wii-dolphin.ps1
 ```
 
 MCP-assisted debugging with [Felk's Python-scripting Dolphin](https://github.com/Felk/dolphin) + [mcp-dolphin](https://github.com/dmang-dev/mcp-dolphin):
 
 ```powershell
-.\scripts\run-wii-dolphin-mcp.ps1
+.\src\wii\scripts\run-wii-dolphin-mcp.ps1
 ```
 
 Or from MSYS2 bash:
 
 ```bash
 export DEVKITPRO=/c/msys64/opt/devkitpro
-./scripts/build-wii.sh
+./src/wii/scripts/build-wii.sh
 ```
 
 macOS / Linux (no host toolchain — official Docker image):
 
 ```bash
-./scripts/build-wii-docker.sh   # uses devkitpro/devkitppc (linux/arm64 on Apple Silicon)
-./scripts/run-wii-dolphin.sh    # mainline Dolphin; brew install --cask dolphin
+./src/wii/scripts/build-wii-docker.sh   # uses devkitpro/devkitppc (linux/arm64 on Apple Silicon)
+./src/wii/scripts/run-wii-dolphin.sh    # mainline Dolphin; brew install --cask dolphin
 ```
 
-Felk Python-scripting Dolphin + `mcp-dolphin` remain a **Windows** debug path (`scripts/run-wii-dolphin-mcp.ps1`); Felk does not ship macOS scripting builds.
+Felk Python-scripting Dolphin + `mcp-dolphin` remain a **Windows** debug path (`src/wii/scripts/run-wii-dolphin-mcp.ps1`); Felk does not ship macOS scripting builds.
 
 Outputs `build-wii/butterscotch.dol` and stages `build-wii/apps/butterscotch/{boot.dol,meta.xml}`.
 
