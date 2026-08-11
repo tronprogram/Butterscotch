@@ -22,7 +22,7 @@ Status as of 2026-08-11: playable through True Pacifist finale on Dolphin (frien
 
 ## Open
 
-- [ ] **CI** — fork workflows should build `PLATFORM=wii` (Docker/`devkitpro/devkitppc`); decide whether `build-wii-data-win.sh` runs in the package path
+- [x] **CI** — `PLATFORM=wii` job in `.github/workflows/build.yml` (`devkitpro/devkitppc`, uploads `boot.dol`)
 - [ ] **Real hardware smoke** — confirm finale residency + System Menu exit on a physical Wii (Dolphin can be kinder on RAM)
 
 ## Standing rules (not tasks)

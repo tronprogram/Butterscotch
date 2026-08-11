@@ -367,6 +367,58 @@ jobs:
           name: ${{ matrix.artifact }}
           path: build/butterscotch.elf
 
+  build-wii:
+    name: Build (Wii)
+    runs-on: ubuntu-24.04
+    container: devkitpro/devkitppc:latest
+    # Compile-only: uploads boot.dol + meta.xml. Never packages data.win / oggs.
+    steps:
+      - name: Install build tools
+        run: |
+          # Image has the PPC toolchain; cmake/python are not always present.
+          if ! command -v cmake >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake python3
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Get commit info
+        id: commit-info
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "hash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "date=$(git log -1 --format=%cd --date=short)" >> $GITHUB_OUTPUT
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-wii \
+            -G "Unix Makefiles" \
+            -DPLATFORM=wii \
+            -DWERROR=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Wii.cmake" \
+            "-DBUTTERSCOTCH_COMMIT_HASH=${{ steps.commit-info.outputs.hash }}" \
+            "-DBUTTERSCOTCH_COMMIT_DATE=${{ steps.commit-info.outputs.date }}"
+
+      - name: Build
+        run: cmake --build build-wii -j"$(nproc)"
+
+      - name: Validate DOL
+        run: |
+          python3 src/wii/scripts/validate-wii-dol.py \
+            build-wii/butterscotch.dol \
+            build-wii/apps/butterscotch/boot.dol
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: butterscotch-wii
+          path: |
+            build-wii/butterscotch.dol
+            build-wii/apps/butterscotch/boot.dol
+            build-wii/apps/butterscotch/meta.xml
+
   build-web:
     name: Build (Web)${{ matrix.label }}
     runs-on: ubuntu-24.04
