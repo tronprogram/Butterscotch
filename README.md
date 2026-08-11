@@ -1,3 +1,47 @@
+# This fork - Nintendo Wii (AI-assisted)
+
+> [!NOTE]
+> This repository is a **fork of [ButterscotchRunner/Butterscotch](https://github.com/ButterscotchRunner/Butterscotch)** focused on a **native Nintendo Wii** port. The Wii work was built **with AI assistance** (Cursor / Codex agents). It is experimental and not affiliated with or endorsed by the upstream project.
+
+| | |
+|---|---|
+| Upstream | https://github.com/ButterscotchRunner/Butterscotch |
+| Fork focus | `PLATFORM=wii` - native GX renderer, AESND audio, HBC `boot.dol` packaging |
+| Open todos | [`TODO-wii.md`](TODO-wii.md) |
+
+### Build & run (Wii)
+
+Requires [devkitPro](https://devkitpro.org/) (`wii-dev`) and MSYS2 `cmake`.
+
+```powershell
+.\scripts\setup-wii-deps.sh   # once, from MSYS2
+.\scripts\build-wii.ps1
+.\scripts\run-wii-dolphin.ps1
+```
+
+MCP-assisted debugging with [Felk's Python-scripting Dolphin](https://github.com/Felk/dolphin) + [mcp-dolphin](https://github.com/dmang-dev/mcp-dolphin):
+
+```powershell
+.\scripts\run-wii-dolphin-mcp.ps1
+```
+
+Or from MSYS2 bash:
+
+```bash
+export DEVKITPRO=/c/msys64/opt/devkitpro
+./scripts/build-wii.sh
+```
+
+Outputs `build-wii/butterscotch.dol` and stages `build-wii/apps/butterscotch/{boot.dol,meta.xml}`.
+
+Copy the `apps/butterscotch` folder to a Dolphin/HBC SD card and place `data.win` (and optional `CONFIG.JSN`) beside `boot.dol`. Default Wiimote map: D-pad -> arrows, A->Z, B->X, +->Enter, Minus->Shift, 1->C, 2->Escape.
+
+---
+
+# Upstream README
+
+The content below is from upstream Butterscotch, kept here for reference. Wii-specific instructions live **only** in the fork section above.
+
 <div align="center">
 <img width="256" height="256" alt="Butterscotch Logo" src="https://github.com/user-attachments/assets/ef8bdd5c-d407-4b3c-a4d5-07b25e8bbc70" />
 </div>

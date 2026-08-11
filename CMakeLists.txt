@@ -16,6 +16,16 @@ endif()
 
 endif()
 
+if(PLATFORM STREQUAL "wii")
+  if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    if(DEFINED ENV{DEVKITPRO})
+      set(CMAKE_TOOLCHAIN_FILE "$ENV{DEVKITPRO}/cmake/Wii.cmake" CACHE PATH "toolchain file")
+    else()
+      message(FATAL_ERROR "Please define DEVKITPRO to point to your SDK path!")
+    endif()
+  endif()
+endif()
+
 project(butterscotch C)
 
 if (PLATFORM STREQUAL "vita")
@@ -65,6 +75,8 @@ if(AUDIO_BACKEND STREQUAL "")
         set(AUDIO_BACKEND "openal")
     elseif(PLATFORM STREQUAL "ps2")
         set(AUDIO_BACKEND "ps2")
+    elseif(PLATFORM STREQUAL "wii")
+        set(AUDIO_BACKEND "wii")
     else()
         set(AUDIO_BACKEND "miniaudio")
     endif()
@@ -78,6 +90,8 @@ elseif(AUDIO_BACKEND STREQUAL "web")
     file(GLOB AUDIO_SOURCES src/audio/web/*.c src/audio/miniaudio/*.c)
 elseif(AUDIO_BACKEND STREQUAL "ps2")
     file(GLOB AUDIO_SOURCES src/audio/ps2/*.c)
+elseif(AUDIO_BACKEND STREQUAL "wii")
+    file(GLOB AUDIO_SOURCES src/audio/wii/*.c)
 elseif(NOT AUDIO_BACKEND STREQUAL "none")
     message(FATAL_ERROR "Invalid AUDIO_BACKEND!")
 endif()
@@ -91,6 +105,10 @@ option(ENABLE_WAD16 "Enable support for WAD Version 15/16" ON)
 option(ENABLE_WAD17 "Enable support for WAD Version 17" ON)
 option(ENABLE_LEGACY_GL "Enable the legacy OpenGL renderer" ON)
 option(ENABLE_MODERN_GL "Enable the modern OpenGL renderer" ON)
+if(PLATFORM STREQUAL "wii")
+    set(ENABLE_LEGACY_GL OFF)
+    set(ENABLE_MODERN_GL OFF)
+endif()
 if(NOT ENABLE_WAD14 AND NOT ENABLE_WAD16 AND NOT ENABLE_WAD17)
     message(FATAL_ERROR "You need to build Butterscotch with at least one WAD version enabled!")
 endif()
@@ -156,6 +174,9 @@ elseif(AUDIO_BACKEND STREQUAL "web")
 elseif(AUDIO_BACKEND STREQUAL "ps2")
     target_include_directories(butterscotch PUBLIC src/audio/ps2)
     add_compile_definitions(USE_PS2_AUDIO)
+elseif(AUDIO_BACKEND STREQUAL "wii")
+    target_include_directories(butterscotch PUBLIC src/audio/wii)
+    add_compile_definitions(USE_WII_AUDIO)
 endif()
 
 # stb_ds
@@ -790,6 +811,66 @@ elseif(PLATFORM STREQUAL "vita")
     vita_create_vpk(Butterscotch.vpk ${VITA_TITLEID} eboot.bin
         VERSION ${VITA_VERSION}
         NAME ${VITA_APP_NAME}
+    )
+elseif(PLATFORM STREQUAL "wii")
+    # Wii EE is single-precision float hardware; keep RValues compact like PS2.
+    add_compile_definitions(USE_FLOAT_REALS)
+    add_compile_definitions(NO_RVALUE_INT64)
+    add_compile_definitions(PLATFORM_WII)
+
+    file(GLOB IMAGE_SOURCES src/image/*.c)
+    target_sources(butterscotch PRIVATE ${IMAGE_SOURCES})
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/image)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/wii)
+    target_include_directories(butterscotch SYSTEM PUBLIC vendor/stb/image)
+
+    target_compile_options(butterscotch PRIVATE
+        -fsingle-precision-constant
+        -fomit-frame-pointer
+        -ffast-math
+        -Wno-format
+    )
+
+    option(ENABLE_VM_GML_PROFILER "Enable Butterscotch VM/interpreter profiler" OFF)
+    if(ENABLE_VM_GML_PROFILER)
+        add_compile_definitions(ENABLE_VM_GML_PROFILER)
+    endif()
+    option(ENABLE_VM_TRACING "Enable Butterscotch VM/interpreter tracing checks" OFF)
+    if(ENABLE_VM_TRACING)
+        add_compile_definitions(ENABLE_VM_TRACING)
+    endif()
+    option(ENABLE_VM_OPCODE_PROFILER "Enable Butterscotch VM opcode count profiler" OFF)
+    if(ENABLE_VM_OPCODE_PROFILER)
+        add_compile_definitions(ENABLE_VM_OPCODE_PROFILER)
+    endif()
+    option(ENABLE_VM_STUB_LOGS "Enable VM unknown/stubbed function logs" OFF)
+    if(ENABLE_VM_STUB_LOGS)
+        add_compile_definitions(ENABLE_VM_STUB_LOGS)
+    endif()
+
+    # Link order: fat/aesnd before ogc (pulled in by the toolchain).
+    target_link_libraries(butterscotch PRIVATE
+        fat
+        aesnd
+        bzip2
+        stb_ds
+        sha1
+        stb_vorbis
+    )
+
+    ogc_create_dol(butterscotch)
+
+    # HBC expects boot.dol next to meta.xml under apps/butterscotch/
+    add_custom_command(TARGET butterscotch POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/apps/butterscotch"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:butterscotch>/butterscotch.dol"
+            "${CMAKE_BINARY_DIR}/apps/butterscotch/boot.dol"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/packaging/wii/meta.xml"
+            "${CMAKE_BINARY_DIR}/apps/butterscotch/meta.xml"
+        COMMENT "Staging HBC apps/butterscotch package"
+        VERBATIM
     )
 else()
     message(FATAL_ERROR "Unknown platform! ${PLATFORM}")

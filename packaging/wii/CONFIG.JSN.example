@@ -1,0 +1,24 @@
+# Sample CONFIG.JSN for Butterscotch on Wii
+#
+# Place next to data.win under sd:/apps/butterscotch/
+#
+# WPAD button masks (decimal):
+#   LEFT=256 RIGHT=512 UP=1024 DOWN=2048
+#   A=8 B=4 PLUS=4096 MINUS=16 1=2 2=1
+{
+  "lazyLoadRooms": true,
+  "eagerlyLoadedRooms": [],
+  "disabledObjects": [],
+  "controller1Mappings": {
+    "256": 37,
+    "512": 39,
+    "1024": 38,
+    "2048": 40,
+    "8": 90,
+    "4": 88,
+    "4096": 13,
+    "16": 16,
+    "2": 67,
+    "1": 27
+  }
+}

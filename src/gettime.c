@@ -2,6 +2,8 @@
 
 #if defined(PLATFORM_PS2)
 #include <timer.h>
+#elif defined(PLATFORM_WII)
+#include <ogc/lwp_watchdog.h>
 #elif defined(PLATFORM_PS3)
 #include <sys/systime.h>
 #elif defined(_WIN32)
@@ -24,6 +26,8 @@ uint64_t nowNanos(void) {
     uint64_t sec = t / clk;
     uint64_t rem = t % clk;
     return sec * 1000000000 + (rem * 1000000000) / clk;
+#elif defined(PLATFORM_WII)
+    return ticks_to_nanosecs(gettime());
 #elif defined(PLATFORM_PS3)
     return ((double)__builtin_ppc_get_timebase()/(double)sysGetTimebaseFrequency());
 #elif defined(_WIN32)

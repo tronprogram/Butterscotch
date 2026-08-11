@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+    <name>Butterscotch</name>
+    <coder>tronprogram / Butterscotch</coder>
+    <version>0.1</version>
+    <release_date>20260101000000</release_date>
+    <short_description>GameMaker runner for Wii</short_description>
+    <long_description>Butterscotch: A GameMaker runner for Nintendo Wii. Place data.win at sd:/apps/butterscotch/data.win and optionally CONFIG.JSN in the same directory.</long_description>
+</app>
