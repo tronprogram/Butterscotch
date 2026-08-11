@@ -22,10 +22,12 @@ WiiDebugOverlayState WiiOverlay_getDebugOverlayState(void);
 void WiiOverlay_setDebugOverlayState(WiiDebugOverlayState state, Runner* runner);
 void WiiOverlay_toggleDebugOverlay(Runner* runner);
 
-// frameDeltaMs: wall-clock ms since previous frame start (includes present/vsync).
+// frameDeltaMs: wall-clock ms since previous display frame start (includes vsync).
+// presentMs: GX_DrawDone + flip time for the previous present call.
+// maxStepIntervalMs: recent max wall-clock gap between Runner_step calls.
 void WiiOverlay_drawDebugOverlay(Renderer* renderer, const Runner* runner,
                                  float tickMs, float stepMs, float drawMs, float audioMs,
-                                 float frameDeltaMs,
+                                 float presentMs, float frameDeltaMs, float maxStepIntervalMs,
                                  int fbWidth, int fbHeight);
 
 #endif /* _BS_WII_OVERLAY_H_ */

@@ -12,6 +12,7 @@ typedef struct {
     int streamingVoices;
     int cachedSounds;
     size_t cachedPcmBytes;
+    uint32_t streamUnderruns;
 } WiiAudioStats;
 
 WiiAudioSystem* WiiAudioSystem_create(void);

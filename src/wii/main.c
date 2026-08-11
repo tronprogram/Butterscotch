@@ -328,58 +328,107 @@ int main(int argc, char* argv[]) {
     WiiOverlay_init();
 
     uint64_t lastTime = nowNanos();
+    float lastPresentMs = 0.0f;
+    uint32_t displayParity = 0;
+    uint64_t lastStepTime = 0;
+    float stepIntervalWindowMaxMs = 0.0f;
+    float overlayStepMaxMs = 0.0f;
+    int stepIntervalWindowFrames = 0;
+    bool havePresented = false;
 
     // ===[ Main Loop ]===
+    // Hybrid from A/B: 60draw present cadence + 30draw Draw timing.
+    // Non-step VI: EFB→XFB duplicate BEFORE any GX that can clobber the EFB
+    // (tex pump used to run first and wipe the held frame). Audio update is
+    // first every VI so stream refill is not stuck behind pump/draw.
     while (!runner->shouldExit) {
         uint64_t frameStart = nowNanos();
         uint64_t deltaNs  = frameStart - lastTime;
         lastTime          = frameStart;
-        runner->deltaTime = (double)deltaNs / 1000.0;
+
+        uint32_t roomSpeed = runner->currentRoom->speed;
+        bool stepThisFrame = (roomSpeed > 35) || ((displayParity & 1u) == 0u);
 
         pollWpad(runner);
 
-        uint64_t stepStart = nowNanos();
-        Runner_step(runner);
-        uint64_t stepEnd = nowNanos();
-
-        Runner_drawPre(runner, winW, winH);
-        Runner_beginFrame(runner, gameW, gameH, winW, winH, winW, winH);
-
-        uint64_t drawStart = nowNanos();
-        Runner_drawViews(runner, gameW, gameH, false);
-        runner->viewCurrent = 0;
-        renderer->vtable->endFrameInit(renderer);
-        Runner_drawPost(runner, winW, winH);
-        renderer->vtable->endFrameEnd(renderer);
-        Runner_drawGUI(runner, winW, winH, gameW, gameH);
-        uint64_t drawEnd = nowNanos();
-
-        RunnerKeyboard_beginFrame(runner->keyboard);
-
-        uint32_t roomSpeed = runner->currentRoom->speed;
-        float dt = (roomSpeed > 0) ? (1.0f / (float)roomSpeed) : (1.0f / 30.0f);
-        if (dt > 0.1f) dt = 0.1f;
+        // Wall-clock dt for APIs that care; stream refill ignores it but keep honest.
+        float dt = (float)((double)deltaNs / 1e9);
+        if (dt <= 0.0f || dt > 0.1f) {
+            dt = (roomSpeed > 0) ? (1.0f / (float)roomSpeed) : (1.0f / 30.0f);
+        }
 
         uint64_t audioStart = nowNanos();
         audioSystem->vtable->update(audioSystem, dt);
         uint64_t audioEnd = nowNanos();
 
-        float tickMs = (float)((double)(audioEnd - frameStart) / 1e6);
-        float stepMs = (float)((double)(stepEnd - stepStart) / 1e6);
-        float drawMs = (float)((double)(drawEnd - drawStart) / 1e6);
-        float audioMs = (float)((double)(audioEnd - audioStart) / 1e6);
-        float frameDeltaMs = (float)((double)deltaNs / 1e6);
-        WiiOverlay_drawDebugOverlay(renderer, runner, tickMs, stepMs, drawMs, audioMs,
-                                    frameDeltaMs, winW, winH);
-
-        GxRenderer_present(renderer);
-
-        Runner_handlePendingRoomChange(runner);
-
-        if (roomSpeed > 0) {
-            uint64_t targetNs = (uint64_t)(1000000000ULL / roomSpeed);
-            while ((nowNanos() - frameStart) < targetNs) {}
+        // Hold EFB→XFB copy must happen before tex pump / draw touch GX.
+        if (!stepThisFrame && havePresented) {
+            uint64_t presentStart = nowNanos();
+            GxRenderer_presentDuplicate(renderer);
+            lastPresentMs = (float)((double)(nowNanos() - presentStart) / 1e6);
         }
+
+        GxRenderer_pumpTexLoads(renderer, 2ull * 1000ull * 1000ull);
+
+        float stepMs = 0.0f;
+        float drawMs = 0.0f;
+        float tickMs = (float)((double)(audioEnd - frameStart) / 1e6);
+
+        if (stepThisFrame) {
+            if (lastStepTime != 0) {
+                float intervalMs = (float)((double)(frameStart - lastStepTime) / 1e6);
+                if (intervalMs > stepIntervalWindowMaxMs) stepIntervalWindowMaxMs = intervalMs;
+                runner->deltaTime = (double)(frameStart - lastStepTime) / 1000.0;
+            } else {
+                runner->deltaTime = (double)deltaNs / 1000.0;
+            }
+            lastStepTime = frameStart;
+
+            uint64_t stepStart = nowNanos();
+            Runner_step(runner);
+            uint64_t stepEnd = nowNanos();
+            stepMs = (float)((double)(stepEnd - stepStart) / 1e6);
+
+            Runner_drawPre(runner, winW, winH);
+            Runner_beginFrame(runner, gameW, gameH, winW, winH, winW, winH);
+
+            uint64_t drawStart = nowNanos();
+            Runner_drawViews(runner, gameW, gameH, false);
+            runner->viewCurrent = 0;
+            renderer->vtable->endFrameInit(renderer);
+            Runner_drawPost(runner, winW, winH);
+            renderer->vtable->endFrameEnd(renderer);
+            Runner_drawGUI(runner, winW, winH, gameW, gameH);
+            uint64_t drawEnd = nowNanos();
+            drawMs = (float)((double)(drawEnd - drawStart) / 1e6);
+
+            RunnerKeyboard_beginFrame(runner->keyboard);
+
+            stepIntervalWindowFrames++;
+            if (stepIntervalWindowFrames >= 30) {
+                overlayStepMaxMs = stepIntervalWindowMaxMs;
+                stepIntervalWindowMaxMs = 0.0f;
+                stepIntervalWindowFrames = 0;
+            }
+
+            tickMs = (float)((double)(drawEnd - frameStart) / 1e6);
+            float audioMs = (float)((double)(audioEnd - audioStart) / 1e6);
+            float stepIntervalMs = (float)(runner->deltaTime / 1000.0);
+            if (stepIntervalMs < 1.0f) stepIntervalMs = 33.333f;
+            WiiOverlay_drawDebugOverlay(renderer, runner, tickMs, stepMs, drawMs, audioMs,
+                                        lastPresentMs, stepIntervalMs, overlayStepMaxMs,
+                                        winW, winH);
+
+            uint64_t presentStart = nowNanos();
+            GxRenderer_present(renderer, false);
+            lastPresentMs = (float)((double)(nowNanos() - presentStart) / 1e6);
+            havePresented = true;
+
+            Runner_handlePendingRoomChange(runner);
+        }
+
+        VIDEO_WaitVSync();
+        displayParity++;
     }
 
     WiiOverlay_deinit();

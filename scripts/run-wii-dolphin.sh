@@ -32,7 +32,10 @@ if [[ -f "${REPO_ROOT}/scripts/validate-wii-dol.py" ]]; then
 fi
 
 mkdir -p "${SYNC}/apps/butterscotch" "${USERDIR}/Config"
-rsync -a --delete "${APP_DIR}/" "${SYNC}/apps/butterscotch/"
+# Never clobber live SD saves with anything under build-wii/.../saves/
+# (a debug LV20 barrier drop-in was reseeding on every launch).
+rsync -a --delete --exclude 'saves/' "${APP_DIR}/" "${SYNC}/apps/butterscotch/"
+mkdir -p "${SYNC}/apps/butterscotch/saves"
 
 # Folder-sync SD so sd:/apps/butterscotch/data.win resolves.
 cat > "${USERDIR}/Config/Dolphin.ini" << INI

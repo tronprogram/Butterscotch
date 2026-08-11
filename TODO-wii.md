@@ -22,9 +22,16 @@ Status as of 2026-08-11: intro → early Ruins (Flowey dialog + Toriel battle) l
 
 - [ ] **Other wide-page crunch** — pages 1/11/14/20 (etc.) still offline NN÷2 for GX width; mild chunkiness on some BG/FX. Optional: WTL1-style split or horizontal tiling at 1:1 if it bothers ship quality
 - [ ] **Finale / heavy-room residency** — many atlases live at once may pressure the ~40MB RGB5A3 budget; watch eviction / missing sprites in True Pacifist ending and dense battles
-- [ ] **Audio stutter** — separate from textures; profile AESND / ogg streaming under load
+- [x] **Frame hitch / stutter (movement + audio)** — merged from `wii/60hz-draw-experiment` 2026-08-11
+  - Hybrid: 60Hz VI; audio first every VI; step + GML Draw every other VI (~30); odd VI = EFB→XFB duplicate
+  - Saves: `run-wii-dolphin.sh` excludes `saves/` from rsync (no more LV20 barrier reseed)
+  - Overlay: `stepMax` + `underrun`
+  - Open: BGM pitch/tempo still slightly off on Dolphin; online 44.1→48k resample too heavy
+- [x] **Saves not sticking / LV20 barrier default** — fixed 2026-08-11
+  - Cause: debug `build-wii/.../saves/` (Chara LV20 room 236) + `rsync --delete` reseeding SD sync each launch
+  - Fix: removed seeded files; `run-wii-dolphin.sh` excludes `saves/` from rsync
 - [ ] **Wii system settings menu** — platform overlay (not Undertale's settings room): button layout, volume, soft reset, return to title/main menu
-- [ ] **Saves** — Overlay FS + `saves/` path; verify write/read on SD sync
+- [ ] **Saves verify** — confirm in-game save survives quit + relaunch via script
 - [ ] **Strip debug / polish** — any leftover Wii logging, letterbox/teal edge artifact if still present
 - [ ] **CI / packaging** — decide whether fork workflows should build `PLATFORM=wii`; HBC `apps/butterscotch` packaging docs; whether `build-wii-data-win.sh` should run in the default package path
 - [ ] **Upstream PR hygiene** — do not open against `ButterscotchRunner/Butterscotch`.

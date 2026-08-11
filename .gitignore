@@ -9,7 +9,9 @@ compat/config.mk
 
 # Local Dolphin / agent scratch
 .dolphin-user/
+.dolphin-user-*/
 .dolphin-user-gx-demo/
+build-wii-compare/
 .atl/
 tools/.venv-wii-tex/
 tools/wii-gx-demo/boot.dol
