@@ -8,6 +8,7 @@
 #include "stdio_compat.h"
 #include "math_compat.h"
 #include "string_compat.h"
+#include "../gettime.h"
 
 #include <gccore.h>
 #include <ogc/gx.h>
@@ -50,13 +51,27 @@ typedef struct {
     uint64_t* texTriedFrame;  // last frame we attempted a load (within-frame dedupe)
     uint64_t* texRetryAfter;  // earliest frame allowed to retry after transient fail
     uint8_t* texFailCount;    // exponential backoff for OOM / decode thrash
+    uint8_t* texWtl1Next;     // 0xFF idle/done; else next WTL1 tile index to decode
+    bool* texWanted;          // draw missed this page — pump after present
     uint64_t frameCounter;
+    // Per-frame decode budget — cold TXTR loads on the draw thread hitch both
+    // movement (1 tick/frame) and audio (stream refill runs after draw).
+    uint32_t texColdLoadsFrame;
+    uint32_t texDeferredFrame;
+    uint32_t texEvictsFrame;
+    uint64_t texDecodeNsFrame;
     int32_t boundPageId;      // last GX_LoadTexObj page (-1 = none)
     int32_t boundSliceIndex;  // last loaded slice within that page
     GXTexObj whiteTex;
     uint8_t* whiteTexData;
     int32_t appSurfW, appSurfH;
 } GxRendererImpl;
+
+// Amortize SD+decode+upload across frames. WTL1 pages decode ONE tile per frame
+// (~1024² RGBA peak) — a full 4-tile page used to hitch ~4× as hard in one go.
+#define GX_TEX_COLD_LOADS_PER_FRAME 1u
+#define GX_TEX_DECODE_BUDGET_NS (6ull * 1000ull * 1000ull)
+#define GX_TEX_WTL1_IDLE 0xFFu
 
 // ===[ Small helpers ]===
 
@@ -194,6 +209,7 @@ static void freeTexPage(GxRendererImpl* gx, uint32_t pageId) {
     gx->texScale[pageId] = 1;
     gx->texLoaded[pageId] = false;
     gx->texLastUsed[pageId] = 0;
+    if (gx->texWtl1Next) gx->texWtl1Next[pageId] = GX_TEX_WTL1_IDLE;
     if (gx->boundPageId == (int32_t)pageId) {
         gx->boundPageId = -1;
         gx->boundSliceIndex = -1;
@@ -203,7 +219,7 @@ static void freeTexPage(GxRendererImpl* gx, uint32_t pageId) {
 static uint64_t residentTexBytes(const GxRendererImpl* gx) {
     uint64_t total = 0;
     for (uint32_t i = 0; i < gx->textureCount; i++) {
-        if (!gx->texLoaded[i] || !gx->texSlices[i] || gx->texW[i] == 0) continue;
+        if (!gx->texSlices || !gx->texSlices[i] || !gx->texW || gx->texW[i] == 0) continue;
         for (int32_t s = 0; s < gx->texSliceCounts[i]; s++) {
             if (gx->texSlices[i][s].data) {
                 total += (uint64_t)gx->texW[i] * (uint64_t)gx->texSlices[i][s].height * (uint64_t)GX_TEX_BPP;
@@ -217,6 +233,7 @@ static bool evictLRUTexPage(GxRendererImpl* gx, uint32_t excludePageId) {
     // Prefer idle pages; if none, allow same-frame eviction so character atlases can
     // stream in when BG pages would otherwise pin the entire budget forever.
     // Backoff on load failure prevents the old re-decode crawl.
+    // Include in-progress WTL1 pages (slices allocated, texLoaded still false).
     uint32_t bestIdle = UINT32_MAX;
     uint64_t bestIdleUsed = UINT64_MAX;
     uint32_t bestAny = UINT32_MAX;
@@ -224,7 +241,7 @@ static bool evictLRUTexPage(GxRendererImpl* gx, uint32_t excludePageId) {
 
     for (uint32_t i = 0; i < gx->textureCount; i++) {
         if (i == excludePageId) continue;
-        if (!gx->texLoaded[i] || !gx->texSlices[i] || gx->texW[i] == 0) continue;
+        if (!gx->texSlices || !gx->texSlices[i] || !gx->texW || gx->texW[i] == 0) continue;
         uint64_t used = gx->texLastUsed[i];
         if (used < bestAnyUsed) {
             bestAnyUsed = used;
@@ -237,9 +254,9 @@ static bool evictLRUTexPage(GxRendererImpl* gx, uint32_t excludePageId) {
     }
     uint32_t best = (bestIdle != UINT32_MAX) ? bestIdle : bestAny;
     if (best == UINT32_MAX) return false;
-    logInfo("GxRenderer: Evicting TXTR page %u (lastUsed=%llu frame=%llu)\n",
-        best, (unsigned long long)gx->texLastUsed[best], (unsigned long long)gx->frameCounter);
+    logInfo("GxRenderer: Evicting TXTR page %u\n", best);
     freeTexPage(gx, best);
+    gx->texEvictsFrame++;
     GX_InvalidateTexAll();
     return true;
 }
@@ -394,8 +411,8 @@ static bool finishTexPageLoad(
     gx->texLastUsed[pageId] = gx->frameCounter;
     gx->texFailCount[pageId] = 0;
     gx->texRetryAfter[pageId] = 0;
-    logInfo("GxRenderer: Loaded TXTR page %u (%dx%d padded to %dx%d, scale=%d, %d GX slice%s, RGB5A3 resident=%.1fMB)\n",
-        pageId, w, h, pw, ph, scale, sliceCount, sliceCount == 1 ? "" : "s",
+    logInfo("GxRenderer: Loaded TXTR page %u (%dx%d, scale=%d, %d slice%s, resident=%.1fMB)\n",
+        pageId, w, h, scale, sliceCount, sliceCount == 1 ? "" : "s",
         (double)residentTexBytes(gx) / (1024.0 * 1024.0));
     return true;
 }
@@ -414,57 +431,198 @@ static bool loadWtl1TexPage(GxRendererImpl* gx, uint32_t pageId, Texture* txtr, 
     int ph = (h + 3) & ~3;
     if (pw > 1024) {
         gx->texLoaded[pageId] = true;
+        gx->texWtl1Next[pageId] = GX_TEX_WTL1_IDLE;
         logWarn("GxRenderer: WTL1 page %u too wide (%d)\n", pageId, pw);
+        return false;
+    }
+
+    uint32_t tileH = (uint32_t)blob[12] | ((uint32_t)blob[13] << 8) |
+                     ((uint32_t)blob[14] << 16) | ((uint32_t)blob[15] << 24);
+    if (tileH == 0 || tileH > 1024) tileH = 1024;
+
+    // First visit this page: allocate slice table; tiles fill across later frames.
+    if (!gx->texSlices[pageId]) {
+        ensureTexBudget(gx, pageId, (uint64_t)pw * (uint64_t)ph * (uint64_t)GX_TEX_BPP);
+        GxTextureSlice* slices = (GxTextureSlice*)allocHeapBytes(
+            gx, pageId, (size_t)tileCount * sizeof(GxTextureSlice));
+        if (!slices) {
+            markTexTransientFail(gx, pageId, "WTL1 slice table alloc failed");
+            return false;
+        }
+        memset(slices, 0, (size_t)tileCount * sizeof(GxTextureSlice));
+        gx->texSlices[pageId] = slices;
+        gx->texSliceCounts[pageId] = (int32_t)tileCount;
+        gx->texW[pageId] = pw;
+        gx->texH[pageId] = ph;
+        gx->texScale[pageId] = 1;
+        gx->texWtl1Next[pageId] = 0;
+    }
+
+    // Touch in-progress pages so they aren't the first eviction victim mid-stream.
+    if (gx->texSlices[pageId]) gx->texLastUsed[pageId] = gx->frameCounter;
+
+    uint32_t i = gx->texWtl1Next[pageId];
+    if (i >= tileCount) {
+        // Shouldn't happen; treat as complete.
+        gx->texWtl1Next[pageId] = GX_TEX_WTL1_IDLE;
+        return finishTexPageLoad(gx, pageId, txtr, gx->texSlices[pageId],
+                                 (int)tileCount, pw, ph, 1, w, h);
+    }
+
+    GxTextureSlice* slices = gx->texSlices[pageId];
+    const uint8_t* ent = blob + 20 + i * 8;
+    uint32_t off = (uint32_t)ent[0] | ((uint32_t)ent[1] << 8) |
+                   ((uint32_t)ent[2] << 16) | ((uint32_t)ent[3] << 24);
+    uint32_t sz  = (uint32_t)ent[4] | ((uint32_t)ent[5] << 8) |
+                   ((uint32_t)ent[6] << 16) | ((uint32_t)ent[7] << 24);
+    if ((size_t)off + (size_t)sz > blobSize || sz == 0) {
+        freeTexPage(gx, pageId);
+        markTexTransientFail(gx, pageId, "WTL1 tile out of range");
+        return false;
+    }
+
+    int tw = 0, th = 0;
+    uint8_t* pixels = ImageDecoder_decodeToRgba(blob + off, (size_t)sz, gm2022_5, &tw, &th);
+    if (!pixels) {
+        freeTexPage(gx, pageId);
+        markTexTransientFail(gx, pageId, "Failed to decode WTL1 tile");
+        return false;
+    }
+
+    GxTextureSlice* slice = &slices[i];
+    slice->y = (int32_t)(i * tileH);
+    if (!uploadRgb5a3Slice(gx, pageId, slice, pixels, tw, th, pw)) {
+        ImageDecoder_freeRgba(pixels);
+        freeTexPage(gx, pageId);
+        markTexTransientFail(gx, pageId, "memalign failed for WTL1 slice");
+        return false;
+    }
+    ImageDecoder_freeRgba(pixels);
+
+    gx->texWtl1Next[pageId] = (uint8_t)(i + 1);
+    if ((uint32_t)gx->texWtl1Next[pageId] < tileCount) {
+        // More tiles remain — not drawable yet; retry next frame.
+        return false;
+    }
+
+    gx->texWtl1Next[pageId] = GX_TEX_WTL1_IDLE;
+    return finishTexPageLoad(gx, pageId, txtr, slices, (int)tileCount, pw, ph, 1, w, h);
+}
+
+static bool advanceTexLoad(GxRendererImpl* gx, uint32_t pageId) {
+    // Permanent logical failure (no blob / corrupt) keeps texLoaded set with texW==0.
+    if (gx->texLoaded[pageId] && gx->texW[pageId] == 0) {
+        if (gx->texWanted) gx->texWanted[pageId] = false;
+        return false;
+    }
+    if (gx->texLoaded[pageId] && gx->texW[pageId] != 0) {
+        if (gx->texWanted) gx->texWanted[pageId] = false;
+        return true;
+    }
+    if (gx->frameCounter < gx->texRetryAfter[pageId]) return false;
+
+    uint64_t loadStartNs = nowNanos();
+
+    DataWin* dw = gx->base.dataWin;
+    Texture* txtr = &dw->txtr.textures[pageId];
+    DataWin_loadTxtrIfNeeded(dw, pageId);
+    if (!txtr->blobData) {
+        gx->texLoaded[pageId] = true; // permanent
+        if (gx->texWanted) gx->texWanted[pageId] = false;
+        gx->texDecodeNsFrame += nowNanos() - loadStartNs;
+        return false;
+    }
+
+    bool gm2022_5 = DataWin_isVersionAtLeast(dw, 2022, 5, 0, 0);
+    bool ok = false;
+
+    int peekW = 0, peekH = 0;
+    uint32_t peekTiles = 0;
+    if (peekWtl1Size(txtr->blobData, (size_t)txtr->blobSize, &peekW, &peekH, &peekTiles)) {
+        ensureTexBudget(gx, pageId,
+            (uint64_t)((peekW + 3) & ~3) * (uint64_t)((peekH + 3) & ~3) * (uint64_t)GX_TEX_BPP);
+        ok = loadWtl1TexPage(gx, pageId, txtr, gm2022_5);
+        gx->texDecodeNsFrame += nowNanos() - loadStartNs;
+        gx->texColdLoadsFrame++;
+        if (ok && gx->texWanted) gx->texWanted[pageId] = false;
+        return ok;
+    }
+
+    if (peekPngSize(txtr->blobData, (size_t)txtr->blobSize, &peekW, &peekH)) {
+        int scale = 1;
+        while (peekW / scale > 1024) scale *= 2;
+        uint64_t uploadBytes = (uint64_t)((peekW / scale + 3) & ~3) *
+                               (uint64_t)((peekH / scale + 3) & ~3) * (uint64_t)GX_TEX_BPP;
+        ensureTexBudget(gx, pageId, uploadBytes);
+    } else {
+        ensureTexBudget(gx, pageId, 8ull * 1024ull * 1024ull);
+    }
+
+    int w = 0, h = 0;
+    uint8_t* pixels = ImageDecoder_decodeToRgba(txtr->blobData, (size_t)txtr->blobSize, gm2022_5, &w, &h);
+    if (!pixels) {
+        gx->texDecodeNsFrame += nowNanos() - loadStartNs;
+        gx->texColdLoadsFrame++;
+        markTexTransientFail(gx, pageId, "Failed to decode TXTR");
+        return false;
+    }
+
+    int scale = 1;
+    while (w / scale > 1024) scale *= 2;
+    if (scale > 1) {
+        int dwScale = 0, dhScale = 0;
+        downsampleRgbaNNInPlace(pixels, w, h, scale, &dwScale, &dhScale);
+        w = dwScale;
+        h = dhScale;
+    }
+
+    int pw = (w + 3) & ~3;
+    int ph = (h + 3) & ~3;
+    if (pw > 1024) {
+        ImageDecoder_freeRgba(pixels);
+        gx->texLoaded[pageId] = true;
+        if (gx->texWanted) gx->texWanted[pageId] = false;
+        gx->texDecodeNsFrame += nowNanos() - loadStartNs;
+        gx->texColdLoadsFrame++;
         return false;
     }
 
     ensureTexBudget(gx, pageId, (uint64_t)pw * (uint64_t)ph * (uint64_t)GX_TEX_BPP);
 
-    GxTextureSlice* slices = (GxTextureSlice*)allocHeapBytes(gx, pageId, (size_t)tileCount * sizeof(GxTextureSlice));
+    int sliceCount = (ph + 1023) / 1024;
+    GxTextureSlice* slices = (GxTextureSlice*)allocHeapBytes(gx, pageId, (size_t)sliceCount * sizeof(GxTextureSlice));
     if (!slices) {
-        markTexTransientFail(gx, pageId, "WTL1 slice table alloc failed");
+        ImageDecoder_freeRgba(pixels);
+        gx->texDecodeNsFrame += nowNanos() - loadStartNs;
+        gx->texColdLoadsFrame++;
+        markTexTransientFail(gx, pageId, "slice table alloc failed for TXTR");
         return false;
     }
-    memset(slices, 0, (size_t)tileCount * sizeof(GxTextureSlice));
+    memset(slices, 0, (size_t)sliceCount * sizeof(GxTextureSlice));
 
-    // tileH is at offset 12
-    uint32_t tileH = (uint32_t)blob[12] | ((uint32_t)blob[13] << 8) | ((uint32_t)blob[14] << 16) | ((uint32_t)blob[15] << 24);
-    if (tileH == 0 || tileH > 1024) tileH = 1024;
-
-    for (uint32_t i = 0; i < tileCount; i++) {
-        const uint8_t* ent = blob + 20 + i * 8;
-        uint32_t off = (uint32_t)ent[0] | ((uint32_t)ent[1] << 8) | ((uint32_t)ent[2] << 16) | ((uint32_t)ent[3] << 24);
-        uint32_t sz  = (uint32_t)ent[4] | ((uint32_t)ent[5] << 8) | ((uint32_t)ent[6] << 16) | ((uint32_t)ent[7] << 24);
-        if ((size_t)off + (size_t)sz > blobSize || sz == 0) {
-            for (uint32_t j = 0; j < i; j++) free(slices[j].data);
+    for (int sliceIndex = 0; sliceIndex < sliceCount; sliceIndex++) {
+        GxTextureSlice* slice = &slices[sliceIndex];
+        slice->y = sliceIndex * 1024;
+        int rem = ph - slice->y;
+        int segH = rem > 1024 ? 1024 : rem;
+        const uint8_t* rowBase = pixels + (size_t)slice->y * (size_t)w * 4;
+        if (!uploadRgb5a3Slice(gx, pageId, slice, rowBase, w, segH, pw)) {
+            for (int i = 0; i < sliceIndex; i++) free(slices[i].data);
             free(slices);
-            markTexTransientFail(gx, pageId, "WTL1 tile out of range");
-            return false;
-        }
-
-        int tw = 0, th = 0;
-        uint8_t* pixels = ImageDecoder_decodeToRgba(blob + off, (size_t)sz, gm2022_5, &tw, &th);
-        if (!pixels) {
-            for (uint32_t j = 0; j < i; j++) free(slices[j].data);
-            free(slices);
-            markTexTransientFail(gx, pageId, "Failed to decode WTL1 tile");
-            return false;
-        }
-
-        GxTextureSlice* slice = &slices[i];
-        slice->y = (int32_t)(i * tileH);
-        // Tile-local pixels: srcOriginY=0, srcH=th
-        if (!uploadRgb5a3Slice(gx, pageId, slice, pixels, tw, th, pw)) {
             ImageDecoder_freeRgba(pixels);
-            for (uint32_t j = 0; j < i; j++) free(slices[j].data);
-            free(slices);
-            markTexTransientFail(gx, pageId, "memalign failed for WTL1 slice");
+            gx->texDecodeNsFrame += nowNanos() - loadStartNs;
+            gx->texColdLoadsFrame++;
+            markTexTransientFail(gx, pageId, "memalign failed for TXTR slice");
             return false;
         }
-        ImageDecoder_freeRgba(pixels);
     }
 
-    return finishTexPageLoad(gx, pageId, txtr, slices, (int)tileCount, pw, ph, 1, w, h);
+    ImageDecoder_freeRgba(pixels);
+    ok = finishTexPageLoad(gx, pageId, txtr, slices, sliceCount, pw, ph, scale, w, h);
+    gx->texDecodeNsFrame += nowNanos() - loadStartNs;
+    gx->texColdLoadsFrame++;
+    if (ok && gx->texWanted) gx->texWanted[pageId] = false;
+    return ok;
 }
 
 static bool ensureTexLoaded(GxRendererImpl* gx, uint32_t pageId) {
@@ -476,105 +634,14 @@ static bool ensureTexLoaded(GxRendererImpl* gx, uint32_t pageId) {
     // Permanent logical failure (no blob / corrupt) keeps texLoaded set with texW==0.
     if (gx->texLoaded[pageId] && gx->texW[pageId] == 0) return false;
 
-    // Transient OOM: exponential backoff so Draw does not re-decode every frame.
+    // Never decode on the draw thread — queue for post-present pump so Step/Draw
+    // (and therefore movement + audio refill timing) stay hitch-free.
     if (gx->frameCounter < gx->texRetryAfter[pageId]) return false;
-    // Only one attempt per page per frame (many sprites share an atlas).
-    if (gx->texTriedFrame[pageId] == gx->frameCounter) return false;
-    gx->texTriedFrame[pageId] = gx->frameCounter;
-
-    DataWin* dw = gx->base.dataWin;
-    Texture* txtr = &dw->txtr.textures[pageId];
-    DataWin_loadTxtrIfNeeded(dw, pageId);
-    if (!txtr->blobData) {
-        gx->texLoaded[pageId] = true; // permanent
-        return false;
+    if (gx->texWanted && !gx->texWanted[pageId]) {
+        gx->texWanted[pageId] = true;
+        gx->texDeferredFrame++;
     }
-
-    bool gm2022_5 = DataWin_isVersionAtLeast(dw, 2022, 5, 0, 0);
-
-    // Prefer WTL1 (tiled) face/battle atlases — decode peak is one 1024-tall PNG.
-    int peekW = 0, peekH = 0;
-    uint32_t peekTiles = 0;
-    if (peekWtl1Size(txtr->blobData, (size_t)txtr->blobSize, &peekW, &peekH, &peekTiles)) {
-        ensureTexBudget(gx, pageId,
-            (uint64_t)((peekW + 3) & ~3) * (uint64_t)((peekH + 3) & ~3) * (uint64_t)GX_TEX_BPP);
-        return loadWtl1TexPage(gx, pageId, txtr, gm2022_5);
-    }
-
-    if (peekPngSize(txtr->blobData, (size_t)txtr->blobSize, &peekW, &peekH)) {
-        int scale = 1;
-        while (peekW / scale > 1024) scale *= 2;
-        uint64_t uploadBytes = (uint64_t)((peekW / scale + 3) & ~3) *
-                               (uint64_t)((peekH / scale + 3) & ~3) * (uint64_t)GX_TEX_BPP;
-        // Resident upload only. Full RGBA decode is temporary malloc (libogc may use MEM2
-        // via sbrk). Face atlases (2048²) may still fail under pressure — do not carve a
-        // permanent MEM2 scratch here; that starved the heap (Frisk/transitions broke).
-        ensureTexBudget(gx, pageId, uploadBytes);
-    } else {
-        ensureTexBudget(gx, pageId, 8ull * 1024ull * 1024ull);
-    }
-
-    int w = 0, h = 0;
-    uint8_t* pixels = ImageDecoder_decodeToRgba(txtr->blobData, (size_t)txtr->blobSize, gm2022_5, &w, &h);
-    if (!pixels) {
-        markTexTransientFail(gx, pageId, "Failed to decode TXTR");
-        return false;
-    }
-
-    // Keep compressed blob until upload succeeds so mid-pipeline OOM does not
-    // force an SD re-read + full decode on every later attempt.
-
-    // Wide GameMaker atlases (2048x…) exceed GX's 1024 cap. Nearest-neighbor downscale
-    // keeps one vertical-slice pipeline and cuts residency 4x for 2048x2048 pages.
-    int scale = 1;
-    while (w / scale > 1024) scale *= 2;
-    if (scale > 1) {
-        int dwScale = 0, dhScale = 0;
-        downsampleRgbaNNInPlace(pixels, w, h, scale, &dwScale, &dhScale);
-        w = dwScale;
-        h = dhScale;
-        logInfo("GxRenderer: Downscaled TXTR page %u by %dx for GX limits\n", pageId, scale);
-    }
-
-    int pw = (w + 3) & ~3;
-    int ph = (h + 3) & ~3;
-    if (pw > 1024) {
-        ImageDecoder_freeRgba(pixels);
-        gx->texLoaded[pageId] = true; // permanent — still too wide
-        logWarn("GxRenderer: TXTR page %u still too wide after downscale (%d)\n", pageId, pw);
-        return false;
-    }
-
-    ensureTexBudget(gx, pageId, (uint64_t)pw * (uint64_t)ph * (uint64_t)GX_TEX_BPP);
-
-    int sliceCount = (ph + 1023) / 1024;
-    GxTextureSlice* slices = (GxTextureSlice*)allocHeapBytes(gx, pageId, (size_t)sliceCount * sizeof(GxTextureSlice));
-    if (!slices) {
-        ImageDecoder_freeRgba(pixels);
-        markTexTransientFail(gx, pageId, "slice table alloc failed for TXTR");
-        return false;
-    }
-    memset(slices, 0, (size_t)sliceCount * sizeof(GxTextureSlice));
-
-    for (int sliceIndex = 0; sliceIndex < sliceCount; sliceIndex++) {
-        GxTextureSlice* slice = &slices[sliceIndex];
-        slice->y = sliceIndex * 1024;
-        int rem = ph - slice->y;
-        int segH = rem > 1024 ? 1024 : rem;
-        // Full-page buffer: pass srcH=ph and srcOriginY=slice->y semantics via upload helper.
-        // Use tile-local view: pointer into pixel rows at slice->y.
-        const uint8_t* rowBase = pixels + (size_t)slice->y * (size_t)w * 4;
-        if (!uploadRgb5a3Slice(gx, pageId, slice, rowBase, w, segH, pw)) {
-            for (int i = 0; i < sliceIndex; i++) free(slices[i].data);
-            free(slices);
-            ImageDecoder_freeRgba(pixels);
-            markTexTransientFail(gx, pageId, "memalign failed for TXTR slice");
-            return false;
-        }
-    }
-
-    ImageDecoder_freeRgba(pixels);
-    return finishTexPageLoad(gx, pageId, txtr, slices, sliceCount, pw, ph, scale, w, h);
+    return false;
 }
 
 static bool resolveTpag(GxRendererImpl* gx, int32_t tpagIndex,
@@ -727,6 +794,9 @@ static void gxInit(Renderer* renderer, DataWin* dataWin) {
     gx->texTriedFrame = (uint64_t*)safeCalloc(gx->textureCount, sizeof(uint64_t));
     gx->texRetryAfter = (uint64_t*)safeCalloc(gx->textureCount, sizeof(uint64_t));
     gx->texFailCount = (uint8_t*)safeCalloc(gx->textureCount, sizeof(uint8_t));
+    gx->texWtl1Next = (uint8_t*)safeCalloc(gx->textureCount, sizeof(uint8_t));
+    memset(gx->texWtl1Next, GX_TEX_WTL1_IDLE, gx->textureCount);
+    gx->texWanted = (bool*)safeCalloc(gx->textureCount, sizeof(bool));
     gx->frameCounter = 1;
     gx->boundPageId = -1;
     gx->boundSliceIndex = -1;
@@ -797,6 +867,8 @@ static void gxDestroy(Renderer* renderer) {
     free(gx->texTriedFrame);
     free(gx->texRetryAfter);
     free(gx->texFailCount);
+    free(gx->texWtl1Next);
+    free(gx->texWanted);
     free(gx->whiteTexData);
     free(gx);
 }
@@ -807,6 +879,9 @@ static void gxBeginFrame(Renderer* renderer, int32_t gameW, int32_t gameH, int32
     GxRendererImpl* gx = (GxRendererImpl*)renderer;
     gx->frameCounter++;
     if (gx->frameCounter == 0) gx->frameCounter = 1;
+    // Decode counters are owned by pumpTexLoads (post-present). Only reset
+    // draw-time "wanted" deferrals here so the overlay can still show last pump.
+    gx->texDeferredFrame = 0;
     gx->boundPageId = -1;
     gx->boundSliceIndex = -1;
     gx->gameW   = gameW;
@@ -1979,19 +2054,61 @@ Renderer* GxRenderer_create(GXRModeObj* rmode, void* xfb0, void* xfb1, u32* fbIn
     return (Renderer*)gx;
 }
 
-void GxRenderer_present(Renderer* renderer) {
+void GxRenderer_present(Renderer* renderer, bool waitVsync) {
     GxRendererImpl* gx = (GxRendererImpl*)renderer;
 
     GX_DrawDone();
 
+    // clearEfb=false: keep EFB pixels so presentDuplicate can CopyDisp again
+    // on the odd VI without a CPU XFB memcpy (that caused black frames + audio hitches).
     GXColor clearClr = {0, 0, 0, 255};
     GX_SetCopyClear(clearClr, GX_MAX_Z24);
-    GX_CopyDisp(gx->xfb[*gx->fbIndex], GX_TRUE);
+    GX_CopyDisp(gx->xfb[*gx->fbIndex], GX_FALSE);
 
     VIDEO_SetNextFramebuffer(gx->xfb[*gx->fbIndex]);
     VIDEO_Flush();
-    VIDEO_WaitVSync();
+    if (waitVsync) VIDEO_WaitVSync();
     *gx->fbIndex ^= 1;
+}
+
+void GxRenderer_presentDuplicate(Renderer* renderer) {
+    GxRendererImpl* gx = (GxRendererImpl*)renderer;
+
+    // EFB still holds the just-presented frame (present used clearEfb=false).
+    // No GX_DrawDone — nothing was submitted since present; keep this cheap for AESND.
+    GX_CopyDisp(gx->xfb[*gx->fbIndex], GX_FALSE);
+    VIDEO_SetNextFramebuffer(gx->xfb[*gx->fbIndex]);
+    VIDEO_Flush();
+    *gx->fbIndex ^= 1;
+}
+
+void GxRenderer_pumpTexLoads(Renderer* renderer, uint64_t budgetNs) {
+    if (!renderer || budgetNs == 0) return;
+    GxRendererImpl* gx = (GxRendererImpl*)renderer;
+    gx->texColdLoadsFrame = 0;
+    gx->texEvictsFrame = 0;
+    gx->texDecodeNsFrame = 0;
+    uint64_t t0 = nowNanos();
+
+    // Prefer finishing in-progress WTL1 pages so they become drawable ASAP.
+    for (uint32_t i = 0; i < gx->textureCount; i++) {
+        if ((nowNanos() - t0) >= budgetNs) return;
+        bool inProgress = gx->texSlices && gx->texSlices[i] && !gx->texLoaded[i] &&
+                          gx->texWtl1Next && gx->texWtl1Next[i] != GX_TEX_WTL1_IDLE;
+        if (!inProgress) continue;
+        advanceTexLoad(gx, i);
+    }
+
+    if (!gx->texWanted) return;
+    for (uint32_t i = 0; i < gx->textureCount; i++) {
+        if ((nowNanos() - t0) >= budgetNs) return;
+        if (!gx->texWanted[i]) continue;
+        if (gx->texLoaded[i] && gx->texW[i] != 0) {
+            gx->texWanted[i] = false;
+            continue;
+        }
+        advanceTexLoad(gx, i);
+    }
 }
 
 void GxRenderer_queryTextureStats(Renderer* renderer, GxTextureStats* out) {
@@ -1999,10 +2116,18 @@ void GxRenderer_queryTextureStats(Renderer* renderer, GxTextureStats* out) {
     out->totalPages = 0;
     out->loadedPages = 0;
     out->residentBytes = 0;
+    out->coldLoadsThisFrame = 0;
+    out->deferredLoadsThisFrame = 0;
+    out->evictsThisFrame = 0;
+    out->decodeMsThisFrame = 0.0f;
     if (!renderer) return;
 
     GxRendererImpl* gx = (GxRendererImpl*)renderer;
     out->totalPages = gx->textureCount;
+    out->coldLoadsThisFrame = gx->texColdLoadsFrame;
+    out->deferredLoadsThisFrame = gx->texDeferredFrame;
+    out->evictsThisFrame = gx->texEvictsFrame;
+    out->decodeMsThisFrame = (float)((double)gx->texDecodeNsFrame / 1e6);
     for (uint32_t i = 0; i < gx->textureCount; i++) {
         if (!gx->texLoaded || !gx->texLoaded[i]) continue;
         if (!gx->texW || gx->texW[i] == 0) continue;
@@ -2011,7 +2136,7 @@ void GxRenderer_queryTextureStats(Renderer* renderer, GxTextureStats* out) {
         for (int32_t s = 0; s < gx->texSliceCounts[i]; s++) {
             GxTextureSlice* slice = &gx->texSlices[i][s];
             if (slice->data) {
-                out->residentBytes += (uint64_t)gx->texW[i] * (uint64_t)slice->height * 4ull;
+                out->residentBytes += (uint64_t)gx->texW[i] * (uint64_t)slice->height * (uint64_t)GX_TEX_BPP;
             }
         }
     }

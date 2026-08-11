@@ -22,7 +22,7 @@
 #define WII_MAX_AUDIO_STREAMS 32
 #define WII_SOUND_INSTANCE_ID_BASE 100000
 #define WII_AUDIO_STREAM_INDEX_BASE 300000
-#define WII_STREAM_FRAMES 8192
+#define WII_STREAM_FRAMES 4096
 #define WII_PCM_ALIGN 32
 
 typedef struct {
@@ -66,6 +66,7 @@ typedef struct VoiceSlot {
     volatile bool streamEnded;
     volatile bool stoppedFlag;
     float streamLengthSeconds;
+    struct WiiAudioSystem* owner;
 } VoiceSlot;
 
 struct WiiAudioSystem {
@@ -77,6 +78,7 @@ struct WiiAudioSystem {
     float masterGain;
     bool muted;
     bool suspended;
+    volatile uint32_t streamUnderruns;
 };
 
 static int16_t* allocAlignedPcm(uint32_t sampleCount) {
@@ -372,6 +374,7 @@ static void voiceCallback(AESNDPB* pb, u32 state, void* cbArg) {
             // Underrun: keep current buffer and urgently request a refill.
             int other = 1 - slot->playBuf;
             slot->needRefill[other] = true;
+            if (slot->owner) slot->owner->streamUnderruns++;
         }
     } else if (state == VOICE_STATE_STOPPED) {
         slot->stoppedFlag = true;
@@ -399,6 +402,7 @@ static bool startStreamingVoice(WiiAudioSystem* sys, VoiceSlot* slot, const char
 
     slot->streaming = true;
     slot->vorbis = v;
+    slot->owner = sys;
     slot->streamBuf[0] = buf0;
     slot->streamBuf[1] = buf1;
     slot->channels = info.channels;
@@ -464,6 +468,7 @@ static bool startOneShotVoice(WiiAudioSystem* sys, VoiceSlot* slot, DecodedSound
     int slotIndex = (int)(slot - sys->voices);
 
     slot->streaming = false;
+    slot->owner = sys;
     slot->soundIndex = soundIndex;
     slot->voice = voice;
     slot->pcm = ds->pcm;
@@ -922,6 +927,7 @@ void WiiAudioSystem_queryStats(AudioSystem* audio, WiiAudioStats* out) {
     out->streamingVoices = 0;
     out->cachedSounds = 0;
     out->cachedPcmBytes = 0;
+    out->streamUnderruns = 0;
     if (!audio) return;
 
     WiiAudioSystem* sys = (WiiAudioSystem*)audio;
@@ -934,4 +940,5 @@ void WiiAudioSystem_queryStats(AudioSystem* audio, WiiAudioStats* out) {
     for (int i = 0; i < (int)arrlen(sys->cache); i++) {
         out->cachedPcmBytes += (size_t)sys->cache[i].sampleCount * sizeof(int16_t);
     }
+    out->streamUnderruns = sys->streamUnderruns;
 }
