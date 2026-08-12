@@ -1,6 +1,6 @@
 # Wii port — open todos
 
-Status as of 2026-08-11: playable through True Pacifist finale on Dolphin (friends scene + Asriel). Full-res WTL1 atlases, hybrid 60Hz present / ~30Hz step, boot + HOME system menu. Checkpoint: `26f0319` on `tronprogram/Butterscotch`.
+Status as of 2026-08-12: playable through True Pacifist finale on Dolphin (friends scene + Asriel). Full-res WTL1 atlases, hybrid 60Hz present / ~30Hz step, boot + HOME system menu, controller icon glyphs + presets, HBC `icon.png`. Checkpoint: `429bef5` on `tronprogram/Butterscotch`.
 
 ## Confirmed working
 
@@ -26,6 +26,17 @@ Status as of 2026-08-11: playable through True Pacifist finale on Dolphin (frien
 - [ ] **Real hardware smoke** — confirm finale residency + System Menu exit on a physical Wii (Dolphin can be kinder on RAM)
 - [x] **Controller icon glyphs** — atlas (Openclipart PD + Kenney CC0 + Zacksly CC BY 3.0). Assemble/bake scripts + `CONTROLLER_ICONS_CREDITS.md`.
 - [x] **Controller presets** — Vertical / Horizontal Wiimote, GameCube, Classic; Controls menu cycles presets + per-binding rebind; saved in `wii_settings.json`.
+- [x] **HBC `icon.png`** — `packaging/wii/icon.png` staged by CMake POST_BUILD with `boot.dol` / `meta.xml`
+  - [ ] Optional: richer logo / cover art; refresh `meta.xml` short/long description once naming/version settle
+- [ ] **Channel WAD — plan (forwarder, not embed)** — System Menu channel that launches SD content
+  - **Model:** tiny forwarder DOL → `sd:/apps/butterscotch/boot.dol`; **do not** embed `data.win` / oggs in the WAD
+  - **Base WAD:** start with CustomizeMii **`StaticBase.wad`** (still banner/icon; no motion). Swap to **`WADder_Base_1/2/3`** (or other homebrew bases) later if we want zoom/rock/etc. — motion comes from the base’s brlan, not from StaticBase. Mirror: [Brawl345/customizemii/Base_WADs](https://github.com/Brawl345/customizemii/tree/master/Base_WADs). Prefer these / OHBC-built shells over ripped Nintendo channels.
+  - [ ] Pick homebrew **title ID** + region; document install/uninstall notes
+  - [ ] Banner kit: `banner.png` / `icon.png` / optional `sound.wav` sources + size checklist (IMET + U8 `banner.bin` / `icon.bin` / `sound.bin`)
+  - [ ] Tooling path on Mac: **Sharpii-NetCore** (or CustomizeMii via Wine) — note exact commands once proven
+  - [ ] Write `packaging/wii/CHANNEL.md` (or similar): StaticBase → inject forwarder + art; optional WADder upgrade path; legal note (no Nintendo banners / no pirated retail WADs)
+  - [ ] Optional script later: “StaticBase (or chosen base) + forwarder DOL + our PNGs → emit Butterscotch channel WAD”
+  - Out of scope for v1: NAND-installing the full game
 
 ## Standing rules (not tasks)
 
