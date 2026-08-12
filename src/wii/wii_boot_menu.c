@@ -1,5 +1,6 @@
 #include "wii_boot_menu.h"
 
+#include "controller_icons.h"
 #include "debug_font.h"
 #include "runner.h"
 #include "utils.h"
@@ -101,19 +102,21 @@ static void uiInitFont(void) {
         linear[i * 4 + 2] = 255;
         linear[i * 4 + 3] = a;
     }
-    size_t tiledBytes = linearBytes;
+
+    size_t tiledBytes = (size_t)DEBUGFONT_ATLAS_W * (size_t)DEBUGFONT_ATLAS_H * 4;
     gUi.fontTexData = (uint8_t*)memalign(32, tiledBytes);
-    if (!gUi.fontTexData) {
-        free(linear);
-        return;
-    }
+    requireNotNull(gUi.fontTexData);
     convertLinearRgba8ToTiled(gUi.fontTexData, linear, DEBUGFONT_ATLAS_W, DEBUGFONT_ATLAS_H);
     free(linear);
     DCFlushRange(gUi.fontTexData, tiledBytes);
+
     GX_InitTexObj(&gUi.fontTex, gUi.fontTexData, DEBUGFONT_ATLAS_W, DEBUGFONT_ATLAS_H,
                   GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
     GX_InitTexObjFilterMode(&gUi.fontTex, GX_NEAR, GX_NEAR);
+    GX_InvalidateTexAll();
     gUi.fontReady = true;
+
+    WiiCtrlIcons_init();
 }
 
 static void uiSetupGx(int fbWidth, int fbHeight) {
@@ -223,6 +226,23 @@ static void uiPresent(GXRModeObj* rmode, void* xfb0, void* xfb1, u32* fbIndex) {
 }
 
 static const char* buttonName(uint32_t mask) {
+    if (WII_INPUT_IS_GC(mask)) {
+        switch (WII_INPUT_GC_PAD(mask)) {
+            case PAD_BUTTON_LEFT:  return "GC Left";
+            case PAD_BUTTON_RIGHT: return "GC Right";
+            case PAD_BUTTON_UP:    return "GC Up";
+            case PAD_BUTTON_DOWN:  return "GC Down";
+            case PAD_BUTTON_A:     return "GC A";
+            case PAD_BUTTON_B:     return "GC B";
+            case PAD_BUTTON_X:     return "GC X";
+            case PAD_BUTTON_Y:     return "GC Y";
+            case PAD_BUTTON_START: return "GC Start";
+            case PAD_TRIGGER_Z:    return "GC Z";
+            case PAD_TRIGGER_L:    return "GC L";
+            case PAD_TRIGGER_R:    return "GC R";
+            default:               return "GC Button";
+        }
+    }
     switch (mask) {
         case WPAD_BUTTON_LEFT:  return "D-Pad Left";
         case WPAD_BUTTON_RIGHT: return "D-Pad Right";
@@ -234,6 +254,22 @@ static const char* buttonName(uint32_t mask) {
         case WPAD_BUTTON_MINUS: return "-";
         case WPAD_BUTTON_1:     return "1";
         case WPAD_BUTTON_2:     return "2";
+        case WPAD_BUTTON_HOME:  return "Home";
+        case WPAD_CLASSIC_BUTTON_LEFT:  return "CL Left";
+        case WPAD_CLASSIC_BUTTON_RIGHT: return "CL Right";
+        case WPAD_CLASSIC_BUTTON_UP:    return "CL Up";
+        case WPAD_CLASSIC_BUTTON_DOWN:  return "CL Down";
+        case WPAD_CLASSIC_BUTTON_A:     return "CL a";
+        case WPAD_CLASSIC_BUTTON_B:     return "CL b";
+        case WPAD_CLASSIC_BUTTON_X:     return "CL x";
+        case WPAD_CLASSIC_BUTTON_Y:     return "CL y";
+        case WPAD_CLASSIC_BUTTON_PLUS:  return "CL +";
+        case WPAD_CLASSIC_BUTTON_MINUS: return "CL -";
+        case WPAD_CLASSIC_BUTTON_HOME:  return "CL Home";
+        case WPAD_CLASSIC_BUTTON_FULL_L: return "CL L";
+        case WPAD_CLASSIC_BUTTON_FULL_R: return "CL R";
+        case WPAD_CLASSIC_BUTTON_ZL:    return "CL ZL";
+        case WPAD_CLASSIC_BUTTON_ZR:    return "CL ZR";
         default: return "Button";
     }
 }
@@ -288,8 +324,101 @@ static float uiLineAdvance(float scale) {
     return (float)DEBUGFONT_LINE_HEIGHT * scale * 0.80f;
 }
 
+typedef struct {
+    WiiCtrlIconId icon;
+    const char* label; // drawn after icon; may be NULL
+} HintPart;
+
+static float uiMeasureText(float scale, const char* text) {
+    if (!text) return 0.0f;
+    float width = 0.0f;
+    float line = 0.0f;
+    for (const char* p = text; *p; p++) {
+        if (*p == '\n') {
+            if (line > width) width = line;
+            line = 0.0f;
+            continue;
+        }
+        const DebugFontGlyphEntry* glyph = lookupGlyph((uint8_t)*p);
+        if (glyph) line += (float)glyph->xadvance * scale;
+    }
+    if (line > width) width = line;
+    return width;
+}
+
+static float drawHintPart(float x, float y, float iconScale, float textScale, const HintPart* part) {
+    WiiCtrlIcons_draw(part->icon, x, y, iconScale, 255, 255, 255, 255);
+    x += WiiCtrlIcons_advance(part->icon, iconScale) + 4.0f;
+    if (part->label && part->label[0]) {
+        uiDrawText(x, y + 2.0f, textScale, 160, 160, 180, 255, part->label);
+        x += uiMeasureText(textScale, part->label) + 14.0f;
+    }
+    return x;
+}
+
+static void drawHintBar(int fbH, const HintPart* parts, int count) {
+    float x = 56.0f;
+    float y = (float)fbH - 54.0f;
+    float iconScale = 0.52f; /* cells are 32px; keep on-screen size ~16px */
+    float textScale = 0.42f;
+    for (int i = 0; i < count; i++) {
+        x = drawHintPart(x, y, iconScale, textScale, &parts[i]);
+    }
+}
+
+static WiiCtrlIconId iconForWpad(uint32_t mask) {
+    if (WII_INPUT_IS_GC(mask)) {
+        switch (WII_INPUT_GC_PAD(mask)) {
+            case PAD_BUTTON_UP:    return WII_CTRL_ICON_GC_DPAD_U;
+            case PAD_BUTTON_DOWN:  return WII_CTRL_ICON_GC_DPAD_D;
+            case PAD_BUTTON_LEFT:  return WII_CTRL_ICON_GC_DPAD_L;
+            case PAD_BUTTON_RIGHT: return WII_CTRL_ICON_GC_DPAD_R;
+            case PAD_BUTTON_A:     return WII_CTRL_ICON_GC_A;
+            case PAD_BUTTON_B:     return WII_CTRL_ICON_GC_B;
+            case PAD_BUTTON_X:     return WII_CTRL_ICON_GC_X;
+            case PAD_BUTTON_Y:     return WII_CTRL_ICON_GC_Y;
+            case PAD_BUTTON_START: return WII_CTRL_ICON_GC_START;
+            case PAD_TRIGGER_Z:    return WII_CTRL_ICON_GC_Z;
+            case PAD_TRIGGER_L:    return WII_CTRL_ICON_GC_L;
+            case PAD_TRIGGER_R:    return WII_CTRL_ICON_GC_R;
+            default:               return WII_CTRL_ICON_GAMECUBE;
+        }
+    }
+    switch (mask) {
+        case WPAD_BUTTON_UP:    return WII_CTRL_ICON_DPAD_U;
+        case WPAD_BUTTON_DOWN:  return WII_CTRL_ICON_DPAD_D;
+        case WPAD_BUTTON_LEFT:  return WII_CTRL_ICON_DPAD_L;
+        case WPAD_BUTTON_RIGHT: return WII_CTRL_ICON_DPAD_R;
+        case WPAD_BUTTON_A:     return WII_CTRL_ICON_WM_A;
+        case WPAD_BUTTON_B:     return WII_CTRL_ICON_WM_B;
+        case WPAD_BUTTON_PLUS:  return WII_CTRL_ICON_PLUS;
+        case WPAD_BUTTON_MINUS: return WII_CTRL_ICON_MINUS;
+        case WPAD_BUTTON_1:     return WII_CTRL_ICON_WM_1;
+        case WPAD_BUTTON_2:     return WII_CTRL_ICON_WM_2;
+        case WPAD_BUTTON_HOME:  return WII_CTRL_ICON_HOME;
+        case WPAD_CLASSIC_BUTTON_UP:    return WII_CTRL_ICON_DPAD_U;
+        case WPAD_CLASSIC_BUTTON_DOWN:  return WII_CTRL_ICON_DPAD_D;
+        case WPAD_CLASSIC_BUTTON_LEFT:  return WII_CTRL_ICON_DPAD_L;
+        case WPAD_CLASSIC_BUTTON_RIGHT: return WII_CTRL_ICON_DPAD_R;
+        case WPAD_CLASSIC_BUTTON_A:     return WII_CTRL_ICON_CL_A;
+        case WPAD_CLASSIC_BUTTON_B:     return WII_CTRL_ICON_CL_B;
+        case WPAD_CLASSIC_BUTTON_X:     return WII_CTRL_ICON_CL_X;
+        case WPAD_CLASSIC_BUTTON_Y:     return WII_CTRL_ICON_CL_Y;
+        case WPAD_CLASSIC_BUTTON_PLUS:  return WII_CTRL_ICON_PLUS;
+        case WPAD_CLASSIC_BUTTON_MINUS: return WII_CTRL_ICON_MINUS;
+        case WPAD_CLASSIC_BUTTON_HOME:  return WII_CTRL_ICON_HOME;
+        case WPAD_CLASSIC_BUTTON_FULL_L: return WII_CTRL_ICON_CL_L;
+        case WPAD_CLASSIC_BUTTON_FULL_R: return WII_CTRL_ICON_CL_R;
+        case WPAD_CLASSIC_BUTTON_ZL:    return WII_CTRL_ICON_CL_ZL;
+        case WPAD_CLASSIC_BUTTON_ZR:    return WII_CTRL_ICON_CL_ZR;
+        default:                return WII_CTRL_ICON_WIIMOTE;
+    }
+}
+
 // Draws the panel chrome. Returns Y where screen content should start.
-static float drawMenuChrome(int fbW, int fbH, const char* title, const char* subtitle, const char* hint) {
+// hintParts/hintCount draw controller icons in the footer (NULL/0 = no footer).
+static float drawMenuChrome(int fbW, int fbH, const char* title, const char* subtitle,
+                            const HintPart* hintParts, int hintCount) {
     uiFillRect(0, 0, (float)fbW, (float)fbH, 8, 8, 18, 255);
     uiFillRect(40, 36, (float)fbW - 80, (float)fbH - 72, 16, 16, 32, 230);
     uiFillRect(40, 36, (float)fbW - 80, 3, 255, 210, 90, 255);
@@ -303,8 +432,8 @@ static float drawMenuChrome(int fbW, int fbH, const char* title, const char* sub
         y += UI_CONTENT_PAD;
     }
 
-    if (hint) {
-        uiDrawText(56, (float)fbH - 52, 0.42f, 160, 160, 180, 255, hint);
+    if (hintParts && hintCount > 0) {
+        drawHintBar(fbH, hintParts, hintCount);
     }
     return y;
 }
@@ -336,28 +465,71 @@ static MenuAction tickScreen(
     const int presetCount = (int)(sizeof(kRoomPresets) / sizeof(kRoomPresets[0]));
 
     if (gUi.waitingRebind) {
-        // Capture first interesting button press as remapping.
-        static const uint32_t capturable[] = {
-            WPAD_BUTTON_LEFT, WPAD_BUTTON_RIGHT, WPAD_BUTTON_UP, WPAD_BUTTON_DOWN,
-            WPAD_BUTTON_A, WPAD_BUTTON_B, WPAD_BUTTON_PLUS, WPAD_BUTTON_MINUS,
-            WPAD_BUTTON_1, WPAD_BUTTON_2,
-        };
-        for (int i = 0; i < (int)(sizeof(capturable) / sizeof(capturable[0])); i++) {
-            if (down & capturable[i]) {
-                if (gUi.rebindIndex >= 0 && gUi.rebindIndex < settings->mapCount) {
-                    // Keep GML key; change which Wii button triggers it.
-                    // Avoid duplicate WPAD masks.
-                    for (int j = 0; j < settings->mapCount; j++) {
-                        if (j != gUi.rebindIndex && settings->maps[j].wpadButton == capturable[i]) {
-                            settings->maps[j].wpadButton = settings->maps[gUi.rebindIndex].wpadButton;
+        // Capture first interesting button for the active preset.
+        if (settings->controllerPreset == WII_CTRL_PRESET_GAMECUBE) {
+            PAD_ScanPads();
+            uint16_t padDown = PAD_ButtonsDown(0);
+            static const uint16_t gcCapturable[] = {
+                PAD_BUTTON_LEFT, PAD_BUTTON_RIGHT, PAD_BUTTON_UP, PAD_BUTTON_DOWN,
+                PAD_BUTTON_A, PAD_BUTTON_B, PAD_BUTTON_X, PAD_BUTTON_Y,
+                PAD_BUTTON_START, PAD_TRIGGER_Z, PAD_TRIGGER_L, PAD_TRIGGER_R,
+            };
+            for (int i = 0; i < (int)(sizeof(gcCapturable) / sizeof(gcCapturable[0])); i++) {
+                if (padDown & gcCapturable[i]) {
+                    uint32_t encoded = WII_INPUT_GC_FLAG | gcCapturable[i];
+                    if (gUi.rebindIndex >= 0 && gUi.rebindIndex < settings->mapCount) {
+                        for (int j = 0; j < settings->mapCount; j++) {
+                            if (j != gUi.rebindIndex && settings->maps[j].wpadButton == encoded) {
+                                settings->maps[j].wpadButton = settings->maps[gUi.rebindIndex].wpadButton;
+                            }
                         }
+                        settings->maps[gUi.rebindIndex].wpadButton = encoded;
+                        *dirtySave = true;
                     }
-                    settings->maps[gUi.rebindIndex].wpadButton = capturable[i];
-                    *dirtySave = true;
+                    gUi.waitingRebind = false;
+                    gUi.screen = SCREEN_CONTROLS;
+                    return ACT_NONE;
                 }
-                gUi.waitingRebind = false;
-                gUi.screen = SCREEN_CONTROLS;
-                return ACT_NONE;
+            }
+        } else {
+            const uint32_t* capturable = NULL;
+            int capturableCount = 0;
+            static const uint32_t wmCapturable[] = {
+                WPAD_BUTTON_LEFT, WPAD_BUTTON_RIGHT, WPAD_BUTTON_UP, WPAD_BUTTON_DOWN,
+                WPAD_BUTTON_A, WPAD_BUTTON_B, WPAD_BUTTON_PLUS, WPAD_BUTTON_MINUS,
+                WPAD_BUTTON_1, WPAD_BUTTON_2,
+            };
+            static const uint32_t clCapturable[] = {
+                WPAD_CLASSIC_BUTTON_LEFT, WPAD_CLASSIC_BUTTON_RIGHT,
+                WPAD_CLASSIC_BUTTON_UP, WPAD_CLASSIC_BUTTON_DOWN,
+                WPAD_CLASSIC_BUTTON_A, WPAD_CLASSIC_BUTTON_B,
+                WPAD_CLASSIC_BUTTON_X, WPAD_CLASSIC_BUTTON_Y,
+                WPAD_CLASSIC_BUTTON_PLUS, WPAD_CLASSIC_BUTTON_MINUS,
+                WPAD_CLASSIC_BUTTON_FULL_L, WPAD_CLASSIC_BUTTON_FULL_R,
+                WPAD_CLASSIC_BUTTON_ZL, WPAD_CLASSIC_BUTTON_ZR,
+            };
+            if (settings->controllerPreset == WII_CTRL_PRESET_CLASSIC) {
+                capturable = clCapturable;
+                capturableCount = (int)(sizeof(clCapturable) / sizeof(clCapturable[0]));
+            } else {
+                capturable = wmCapturable;
+                capturableCount = (int)(sizeof(wmCapturable) / sizeof(wmCapturable[0]));
+            }
+            for (int i = 0; i < capturableCount; i++) {
+                if (down & capturable[i]) {
+                    if (gUi.rebindIndex >= 0 && gUi.rebindIndex < settings->mapCount) {
+                        for (int j = 0; j < settings->mapCount; j++) {
+                            if (j != gUi.rebindIndex && settings->maps[j].wpadButton == capturable[i]) {
+                                settings->maps[j].wpadButton = settings->maps[gUi.rebindIndex].wpadButton;
+                            }
+                        }
+                        settings->maps[gUi.rebindIndex].wpadButton = capturable[i];
+                        *dirtySave = true;
+                    }
+                    gUi.waitingRebind = false;
+                    gUi.screen = SCREEN_CONTROLS;
+                    return ACT_NONE;
+                }
             }
         }
         if (down & WPAD_BUTTON_HOME) {
@@ -435,19 +607,40 @@ static MenuAction tickScreen(
             break;
         }
         case SCREEN_CONTROLS: {
-            int items = settings->mapCount + 2; // maps + reset + back
+            /* cursor: 0 = preset, 1..mapCount = bindings, then reset, back */
+            int items = settings->mapCount + 3;
             if (gUi.cursor >= items) gUi.cursor = items - 1;
             if (down & WPAD_BUTTON_B) {
                 gUi.screen = SCREEN_MAIN;
                 gUi.cursor = inGame ? 0 : 2;
             }
+            if (gUi.cursor == 0) {
+                if (down & WPAD_BUTTON_LEFT) {
+                    int p = settings->controllerPreset - 1;
+                    if (p < 0) p = WII_CTRL_PRESET_COUNT - 1;
+                    WiiSettings_applyPreset(settings, p);
+                    *dirtySave = true;
+                }
+                if (down & WPAD_BUTTON_RIGHT) {
+                    int p = settings->controllerPreset + 1;
+                    if (p >= WII_CTRL_PRESET_COUNT) p = 0;
+                    WiiSettings_applyPreset(settings, p);
+                    *dirtySave = true;
+                }
+            }
             if (down & (WPAD_BUTTON_A | WPAD_BUTTON_PLUS)) {
-                if (gUi.cursor < settings->mapCount) {
-                    gUi.rebindIndex = gUi.cursor;
+                if (gUi.cursor == 0) {
+                    /* A on preset row also cycles forward */
+                    int p = settings->controllerPreset + 1;
+                    if (p >= WII_CTRL_PRESET_COUNT) p = 0;
+                    WiiSettings_applyPreset(settings, p);
+                    *dirtySave = true;
+                } else if (gUi.cursor >= 1 && gUi.cursor <= settings->mapCount) {
+                    gUi.rebindIndex = gUi.cursor - 1;
                     gUi.waitingRebind = true;
                     gUi.screen = SCREEN_REBIND;
-                } else if (gUi.cursor == settings->mapCount) {
-                    WiiSettings_installDefaultMaps(settings);
+                } else if (gUi.cursor == settings->mapCount + 1) {
+                    WiiSettings_applyPreset(settings, settings->controllerPreset);
                     *dirtySave = true;
                 } else {
                     gUi.screen = SCREEN_MAIN;
@@ -504,21 +697,41 @@ static void drawScreen(int fbW, int fbH, const WiiPortSettings* settings, bool i
     float y;
 
     if (gUi.waitingRebind || gUi.screen == SCREEN_REBIND) {
-        y = drawMenuChrome(fbW, fbH, "Rebind", NULL, "Press a Wiimote button  |  HOME cancel");
+        HintPart rebindHint[2];
+        if (settings->controllerPreset == WII_CTRL_PRESET_GAMECUBE) {
+            rebindHint[0].icon = WII_CTRL_ICON_GAMECUBE;
+            rebindHint[0].label = " press a button";
+        } else if (settings->controllerPreset == WII_CTRL_PRESET_CLASSIC) {
+            rebindHint[0].icon = WII_CTRL_ICON_CLASSIC;
+            rebindHint[0].label = " press a button";
+        } else {
+            rebindHint[0].icon = WII_CTRL_ICON_WIIMOTE;
+            rebindHint[0].label = " press a button";
+        }
+        rebindHint[1].icon = WII_CTRL_ICON_HOME;
+        rebindHint[1].label = " cancel";
+        y = drawMenuChrome(fbW, fbH, "Rebind", NULL, rebindHint, 2);
         if (gUi.rebindIndex >= 0 && gUi.rebindIndex < settings->mapCount) {
             snprintf(line, sizeof(line), "Remapping: %s", gmlKeyName(settings->maps[gUi.rebindIndex].gmlKey));
             uiDrawText(x, y, UI_TEXT_SCALE, 255, 255, 255, 255, line);
-            uiDrawText(x, y + UI_LINE * 2, UI_TEXT_SCALE, 200, 200, 210, 255, "Waiting for button...");
+            snprintf(line, sizeof(line), "Waiting for %s button...",
+                     WiiSettings_presetName(settings->controllerPreset));
+            uiDrawText(x, y + UI_LINE * 2, UI_TEXT_SCALE, 200, 200, 210, 255, line);
         }
         return;
     }
 
     switch (gUi.screen) {
-        case SCREEN_MAIN:
+        case SCREEN_MAIN: {
+            static const HintPart mainHint[] = {
+                { WII_CTRL_ICON_DPAD, " move" },
+                { WII_CTRL_ICON_WM_A, " confirm" },
+                { WII_CTRL_ICON_WM_B, " back" },
+            };
             y = drawMenuChrome(fbW, fbH,
                                inGame ? "Butterscotch  |  System" : "Butterscotch",
                                inGame ? "Game paused" : "Wii Undertale port",
-                               "D-Pad move  |  A confirm  |  B back");
+                               mainHint, 3);
             if (!inGame) {
                 drawSelectable(x, y + UI_LINE * 0, gUi.cursor == 0, "Start Game");
                 drawSelectable(x, y + UI_LINE * 1, gUi.cursor == 1, "Options");
@@ -533,27 +746,83 @@ static void drawScreen(int fbW, int fbH, const WiiPortSettings* settings, bool i
                 drawSelectable(x, y + UI_LINE * 3, gUi.cursor == 3, "Return to Wii Menu");
             }
             break;
-        case SCREEN_OPTIONS:
-            y = drawMenuChrome(fbW, fbH, "Options", NULL, "Left/Right adjust  |  B back");
+        }
+        case SCREEN_OPTIONS: {
+            static const HintPart optHint[] = {
+                { WII_CTRL_ICON_DPAD, " adjust" },
+                { WII_CTRL_ICON_WM_B, " back" },
+            };
+            y = drawMenuChrome(fbW, fbH, "Options", NULL, optHint, 2);
             snprintf(line, sizeof(line), "Master Volume ...... %3d%%", (int)(settings->masterGain * 100.0f + 0.5f));
             drawSelectable(x, y + UI_LINE * 0, gUi.cursor == 0, line);
             snprintf(line, sizeof(line), "Debug Overlay ...... %s", overlayName(settings->debugOverlay));
             drawSelectable(x, y + UI_LINE * 1, gUi.cursor == 1, line);
             drawSelectable(x, y + UI_LINE * 2, gUi.cursor == 2, "Back");
             break;
-        case SCREEN_CONTROLS:
-            y = drawMenuChrome(fbW, fbH, "Controls", NULL, "A rebind  |  B back");
+        }
+        case SCREEN_CONTROLS: {
+            static const HintPart ctrlHint[] = {
+                { WII_CTRL_ICON_DPAD, " preset" },
+                { WII_CTRL_ICON_WM_A, " rebind" },
+                { WII_CTRL_ICON_WM_B, " back" },
+            };
+            y = drawMenuChrome(fbW, fbH, "Controls", NULL, ctrlHint, 3);
+            {
+                float px = x;
+                float py = y - UI_LINE * 0.15f;
+                const float padScale = 0.55f;
+                WiiCtrlIconId activePad = WII_CTRL_ICON_WIIMOTE;
+                bool wmActive = settings->controllerPreset == WII_CTRL_PRESET_WIIMOTE_VERT
+                             || settings->controllerPreset == WII_CTRL_PRESET_WIIMOTE_HORIZ;
+                if (settings->controllerPreset == WII_CTRL_PRESET_GAMECUBE) {
+                    activePad = WII_CTRL_ICON_GAMECUBE;
+                } else if (settings->controllerPreset == WII_CTRL_PRESET_CLASSIC) {
+                    activePad = WII_CTRL_ICON_CLASSIC;
+                }
+                WiiCtrlIcons_draw(WII_CTRL_ICON_WIIMOTE, px, py, padScale,
+                                  wmActive ? 255 : 120, wmActive ? 255 : 120, wmActive ? 255 : 120, 255);
+                px += WiiCtrlIcons_advance(WII_CTRL_ICON_WIIMOTE, padScale) + 6.0f;
+                WiiCtrlIcons_draw(WII_CTRL_ICON_GAMECUBE, px, py, padScale,
+                                  activePad == WII_CTRL_ICON_GAMECUBE ? 255 : 120,
+                                  activePad == WII_CTRL_ICON_GAMECUBE ? 255 : 120,
+                                  activePad == WII_CTRL_ICON_GAMECUBE ? 255 : 120, 255);
+                px += WiiCtrlIcons_advance(WII_CTRL_ICON_GAMECUBE, padScale) + 6.0f;
+                WiiCtrlIcons_draw(WII_CTRL_ICON_CLASSIC, px, py, padScale,
+                                  activePad == WII_CTRL_ICON_CLASSIC ? 255 : 120,
+                                  activePad == WII_CTRL_ICON_CLASSIC ? 255 : 120,
+                                  activePad == WII_CTRL_ICON_CLASSIC ? 255 : 120, 255);
+                y += UI_LINE * 1.1f;
+            }
+            snprintf(line, sizeof(line), "Preset  < %s >",
+                     WiiSettings_presetName(settings->controllerPreset));
+            drawSelectable(x, y, gUi.cursor == 0, line);
             for (int i = 0; i < settings->mapCount; i++) {
+                float rowY = y + UI_LINE * (float)(i + 1);
+                const float rowIconScale = 0.50f;
+                WiiCtrlIconId ic = iconForWpad(settings->maps[i].wpadButton);
+                WiiCtrlIcons_draw(ic, x, rowY, rowIconScale, 255, 255, 255, 255);
                 snprintf(line, sizeof(line), "%-12s -> %s",
                          buttonName(settings->maps[i].wpadButton),
                          gmlKeyName(settings->maps[i].gmlKey));
-                drawSelectable(x, y + UI_LINE * (float)i, gUi.cursor == i, line);
+                drawSelectable(x + 22.0f, rowY, gUi.cursor == i + 1, line);
             }
-            drawSelectable(x, y + UI_LINE * (float)settings->mapCount, gUi.cursor == settings->mapCount, "Reset to defaults");
-            drawSelectable(x, y + UI_LINE * (float)(settings->mapCount + 1), gUi.cursor == settings->mapCount + 1, "Back");
+            drawSelectable(x, y + UI_LINE * (float)(settings->mapCount + 1),
+                           gUi.cursor == settings->mapCount + 1, "Reset preset defaults");
+            drawSelectable(x, y + UI_LINE * (float)(settings->mapCount + 2),
+                           gUi.cursor == settings->mapCount + 2, "Back");
+            if (settings->controllerPreset == WII_CTRL_PRESET_GAMECUBE
+                || settings->controllerPreset == WII_CTRL_PRESET_CLASSIC) {
+                uiDrawText(x, y + UI_LINE * (float)(settings->mapCount + 3.4f), 0.40f,
+                           150, 160, 180, 255, "Left stick also moves (with D-pad).");
+            }
             break;
-        case SCREEN_EXTRAS:
-            y = drawMenuChrome(fbW, fbH, "Extras", NULL, "Left/Right change room  |  B back");
+        }
+        case SCREEN_EXTRAS: {
+            static const HintPart extrasHint[] = {
+                { WII_CTRL_ICON_DPAD, " change room" },
+                { WII_CTRL_ICON_WM_B, " back" },
+            };
+            y = drawMenuChrome(fbW, fbH, "Extras", NULL, extrasHint, 2);
             snprintf(line, sizeof(line), "Start Room  < %s >", kRoomPresets[gUi.roomPresetIndex].label);
             drawSelectable(x, y + UI_LINE * 0, gUi.cursor == 0, line);
             if (settings->startRoomName[0]) {
@@ -565,8 +834,13 @@ static void drawScreen(int fbW, int fbH, const WiiPortSettings* settings, bool i
             uiDrawText(x, y + UI_LINE * 5, 0.40f, 170, 150, 150, 255,
                        "Room jump skips normal boot flow — saves may look weird.");
             break;
-        case SCREEN_ABOUT:
-            y = drawMenuChrome(fbW, fbH, "About", NULL, "A / B back");
+        }
+        case SCREEN_ABOUT: {
+            static const HintPart aboutHint[] = {
+                { WII_CTRL_ICON_WM_A, " / " },
+                { WII_CTRL_ICON_WM_B, " back" },
+            };
+            y = drawMenuChrome(fbW, fbH, "About", NULL, aboutHint, 2);
             uiDrawText(x, y, UI_TEXT_SCALE, 230, 230, 240, 255, "Butterscotch on Wii");
             uiDrawText(x, y + UI_LINE * 1.2f, 0.45f, 200, 200, 210, 255,
                        "GameMaker runner port — GX renderer, AESND audio,");
@@ -574,10 +848,13 @@ static void drawScreen(int fbW, int fbH, const WiiPortSettings* settings, bool i
                        "WTL1 tiled atlases for full-res sprites.");
             uiDrawText(x, y + UI_LINE * 3.5f, 0.45f, 200, 200, 210, 255,
                        "Fork playground. Not affiliated with Toby Fox.");
-            uiDrawText(x, y + UI_LINE * 5, 0.45f, 255, 210, 90, 255,
+            uiDrawText(x, y + UI_LINE * 5.0f, 0.40f, 160, 165, 180, 255,
+                       "Icons: Openclipart + Kenney (CC0) + Zacksly GC (CC BY).");
+            uiDrawText(x, y + UI_LINE * 5.9f, 0.40f, 160, 165, 180, 255,
                        "HOME in-game opens this system menu.");
-            drawSelectable(x, y + UI_LINE * 7, true, "Back");
+            drawSelectable(x, y + UI_LINE * 7.5f, true, "Back");
             break;
+        }
         default:
             break;
     }
@@ -641,6 +918,7 @@ WiiBootResult WiiBootMenu_run(
     WiiPortSettings* settings
 ) {
     WPAD_Init();
+    PAD_Init();
     logInfo("WiiBootMenu: entering pre-boot shell\n");
     MenuAction act = runMenuLoop(rmode, xfb0, xfb1, fbIndex, bundleDir, settings, false, NULL);
     if (act == ACT_EXIT_TO_WII_MENU) return WII_BOOT_RETURN_TO_MENU;

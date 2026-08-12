@@ -14,5 +14,6 @@ compat/config.mk
 build-wii-compare/
 .atl/
 tools/.venv-wii-tex/
+tools/controller-icons-src/
 tools/wii-gx-demo/boot.dol
 tools/wii-gx-demo/boot.elf

@@ -24,6 +24,8 @@ Status as of 2026-08-11: playable through True Pacifist finale on Dolphin (frien
 
 - [x] **CI** — `PLATFORM=wii` job in `.github/workflows/build.yml` (`devkitpro/devkitppc`, uploads `boot.dol`)
 - [ ] **Real hardware smoke** — confirm finale residency + System Menu exit on a physical Wii (Dolphin can be kinder on RAM)
+- [x] **Controller icon glyphs** — atlas (Openclipart PD + Kenney CC0 + Zacksly CC BY 3.0). Assemble/bake scripts + `CONTROLLER_ICONS_CREDITS.md`.
+- [x] **Controller presets** — Vertical / Horizontal Wiimote, GameCube, Classic; Controls menu cycles presets + per-binding rebind; saved in `wii_settings.json`.
 
 ## Standing rules (not tasks)
 

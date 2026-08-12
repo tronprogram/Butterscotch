@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <malloc.h>
+#include <math.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -42,6 +43,7 @@ static int         wiiMappingCount = 0;
 static WiiMapping  wiiMappingsOwned[WII_SETTINGS_MAP_MAX];
 
 static uint32_t prevHeld = 0;
+static uint16_t prevHeldPad = 0;
 
 static GXRModeObj* gRmode = NULL;
 static void* gXfb0 = NULL;
@@ -52,6 +54,35 @@ static WiiPortSettings gPortSettings;
 static AudioSystem* gAudioSystem = NULL;
 
 static void installDefaultMappings(void);
+
+/* Left stick → digital dirs (OR'd with D-pad). GC stick is s8; Classic uses calibrated mag/ang. */
+#define WII_STICK_DEADZONE_GC 36
+#define WII_STICK_DEADZONE_CL 0.30f
+
+static void orLeftStickIntoHeld(uint16_t* heldPad, uint32_t* heldWpad) {
+    s8 sx = PAD_StickX(0);
+    s8 sy = PAD_StickY(0);
+    if (sx < -WII_STICK_DEADZONE_GC) *heldPad |= PAD_BUTTON_LEFT;
+    if (sx >  WII_STICK_DEADZONE_GC) *heldPad |= PAD_BUTTON_RIGHT;
+    if (sy >  WII_STICK_DEADZONE_GC) *heldPad |= PAD_BUTTON_UP;
+    if (sy < -WII_STICK_DEADZONE_GC) *heldPad |= PAD_BUTTON_DOWN;
+
+    expansion_t exp;
+    WPAD_Expansion(0, &exp);
+    if (exp.type == WPAD_EXP_CLASSIC) {
+        float mag = exp.classic.ljs.mag;
+        if (mag > 0.01f) {
+            /* ang: 0=up, 90=right, 180=down, 270=left */
+            float rad = exp.classic.ljs.ang * (3.14159265f / 180.0f);
+            float x = mag * sinf(rad);
+            float y = mag * cosf(rad);
+            if (x < -WII_STICK_DEADZONE_CL) *heldWpad |= WPAD_CLASSIC_BUTTON_LEFT;
+            if (x >  WII_STICK_DEADZONE_CL) *heldWpad |= WPAD_CLASSIC_BUTTON_RIGHT;
+            if (y >  WII_STICK_DEADZONE_CL) *heldWpad |= WPAD_CLASSIC_BUTTON_UP;
+            if (y < -WII_STICK_DEADZONE_CL) *heldWpad |= WPAD_CLASSIC_BUTTON_DOWN;
+        }
+    }
+}
 
 static void applyPortMappings(const WiiPortSettings* s) {
     int n = s->mapCount;
@@ -141,10 +172,13 @@ static void returnToWiiMenu(void) {
 
 static void pollWpad(Runner* runner) {
     WPAD_ScanPads();
-    uint32_t held = WPAD_ButtonsHeld(0);
-    uint32_t down = WPAD_ButtonsDown(0);
+    PAD_ScanPads();
+    uint32_t heldWpad = WPAD_ButtonsHeld(0);
+    uint32_t downWpad = WPAD_ButtonsDown(0);
+    uint16_t heldPad = PAD_ButtonsHeld(0);
+    orLeftStickIntoHeld(&heldPad, &heldWpad);
 
-    if (down & WPAD_BUTTON_HOME) {
+    if (downWpad & WPAD_BUTTON_HOME) {
         if (gAudioSystem && gAudioSystem->vtable && gAudioSystem->vtable->pauseAll) {
             gAudioSystem->vtable->pauseAll(gAudioSystem);
         }
@@ -157,6 +191,7 @@ static void pollWpad(Runner* runner) {
         WiiOverlay_setDebugOverlayState((WiiDebugOverlayState)gPortSettings.debugOverlay, runner);
         // Drop held keys so a held A from the menu doesn't leak into GML.
         prevHeld = 0;
+        prevHeldPad = 0;
         if (runner->keyboard) {
             for (int k = 0; k < GML_KEY_COUNT; k++) {
                 if (runner->keyboard->keyDown[k]) {
@@ -187,14 +222,23 @@ static void pollWpad(Runner* runner) {
     }
 
     repeat(wiiMappingCount, i) {
-        uint32_t mask   = wiiMappings[i].wpadButton;
-        int32_t  gmlKey = wiiMappings[i].gmlKey;
-        bool wasHeld = (prevHeld & mask) != 0;
-        bool isHeld  = (held    & mask) != 0;
+        uint32_t mask = wiiMappings[i].wpadButton;
+        int32_t gmlKey = wiiMappings[i].gmlKey;
+        bool wasHeld;
+        bool isHeld;
+        if (WII_INPUT_IS_GC(mask)) {
+            uint16_t padMask = WII_INPUT_GC_PAD(mask);
+            wasHeld = (prevHeldPad & padMask) != 0;
+            isHeld = (heldPad & padMask) != 0;
+        } else {
+            wasHeld = (prevHeld & mask) != 0;
+            isHeld = (heldWpad & mask) != 0;
+        }
         if (isHeld && !wasHeld) RunnerKeyboard_onKeyDown(runner->keyboard, gmlKey);
         else if (!isHeld && wasHeld) RunnerKeyboard_onKeyUp(runner->keyboard, gmlKey);
     }
-    prevHeld = held;
+    prevHeld = heldWpad;
+    prevHeldPad = heldPad;
 }
 
 static void hangBlackScreen(void) {
@@ -423,8 +467,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ===[ WPAD ]===
-    // Boot menu already called WPAD_Init(); safe to call again.
+    // ===[ WPAD / PAD ]===
+    // Boot menu already called WPAD_Init()/PAD_Init(); safe to call again.
+    WPAD_Init();
+    PAD_Init();
 
     // ===[ First Room ]===
     logInfo("Initializing first room...\n");
