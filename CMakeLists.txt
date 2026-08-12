@@ -883,6 +883,9 @@ elseif(PLATFORM STREQUAL "wii")
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/packaging/wii/meta.xml"
             "${CMAKE_BINARY_DIR}/apps/butterscotch/meta.xml"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/packaging/wii/icon.png"
+            "${CMAKE_BINARY_DIR}/apps/butterscotch/icon.png"
         COMMENT "Staging HBC apps/butterscotch package"
         VERBATIM
     )

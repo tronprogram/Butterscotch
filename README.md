@@ -45,9 +45,28 @@ macOS / Linux (no host toolchain — official Docker image):
 
 Felk Python-scripting Dolphin + `mcp-dolphin` remain a **Windows** debug path (`src/wii/scripts/run-wii-dolphin-mcp.ps1`); Felk does not ship macOS scripting builds.
 
-Outputs `build-wii/butterscotch.dol` and stages `build-wii/apps/butterscotch/{boot.dol,meta.xml}`.
+Outputs `build-wii/butterscotch.dol` and stages `build-wii/apps/butterscotch/{boot.dol,meta.xml,icon.png}`.
 
-Copy the `apps/butterscotch` folder to a Dolphin/HBC SD card and place `data.win` (and optional `CONFIG.JSN`) beside `boot.dol`. Default Wiimote map: D-pad -> arrows, A->Z, B->X, +->Enter, Minus->Shift, 1->C, 2->Escape.
+### Load the game (after you have a `.dol`)
+
+Butterscotch looks for game files under **`sd:/apps/butterscotch/`** (HBC layout). Put the runner and Undertale assets in the same folder:
+
+```
+apps/butterscotch/
+  boot.dol          # from the build (or rename butterscotch.dol → boot.dol)
+  meta.xml          # from packaging/wii/ (HBC listing)
+  icon.png          # from packaging/wii/ (HBC icon, 128×48)
+  data.win          # Undertale data.win (WTL1-prepared if you use the texture pipeline)
+  *.ogg             # Undertale music/SFX next to data.win (required for audio)
+  CONFIG.JSN        # optional
+  saves/            # created at runtime
+```
+
+**Homebrew Channel (real SD / USB loader):** copy that whole `apps/butterscotch` folder onto the SD card’s `apps/` directory, then launch **Butterscotch** from HBC.
+
+**Dolphin:** enable Wii SD card + folder sync, point the sync folder at a directory that contains `apps/butterscotch/` as above (Windows often uses `%AppData%\Dolphin Emulator\Load\WiiSDSync`), then open/run `boot.dol` (File → Open, or `Dolphin.exe -e path\to\boot.dol`).
+
+On first boot, use the on-screen shell (**Controls**) to pick a preset (vertical/horizontal Wiimote, GameCube, Classic). Default vertical Wiimote map: D-pad → arrows, A→Z, B→X, +→Enter, −→Shift, 1→C, 2→Escape. In-game, **HOME** opens the system menu.
 
 ---
 
