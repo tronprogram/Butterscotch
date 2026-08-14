@@ -2659,6 +2659,34 @@ void DataWin_loadTxtrIfNeeded(DataWin* dw, uint32_t textureId) {
     }
 }
 
+bool DataWin_readTxtr(DataWin* dw, uint32_t textureId, uint32_t relOff, uint32_t size, void* dest) {
+    if (!dw || !dest || size == 0) return false;
+    if (textureId >= dw->txtr.count) return false;
+    Texture* tex = &dw->txtr.textures[textureId];
+    if (tex->blobOffset == 0 || tex->blobSize == 0) return false;
+    if ((uint64_t)relOff + (uint64_t)size > (uint64_t)tex->blobSize) return false;
+
+    if (tex->blobData) {
+        memcpy(dest, tex->blobData + relOff, size);
+        return true;
+    }
+    if (dw->mappedFile) {
+        memcpy(dest, dw->mappedFile + tex->blobOffset + relOff, size);
+        return true;
+    }
+    if (!dw->lazyLoadFile) return false;
+
+    long old_seek = ftell(dw->lazyLoadFile);
+    if (old_seek < 0) return false;
+    if (fseek(dw->lazyLoadFile, (long)tex->blobOffset + (long)relOff, SEEK_SET) != 0) {
+        fseek(dw->lazyLoadFile, old_seek, SEEK_SET);
+        return false;
+    }
+    size_t n = fread(dest, 1, size, dw->lazyLoadFile);
+    fseek(dw->lazyLoadFile, old_seek, SEEK_SET);
+    return n == size;
+}
+
 static void parseAUDO(BinaryReader* reader, DataWin* dw, bool loadAudioDataLazily) {
     Audo* a = &dw->audo;
 
@@ -2691,7 +2719,9 @@ static void parseAUDO(BinaryReader* reader, DataWin* dw, bool loadAudioDataLazil
 }
 
 void DataWin_loadAudoIfNeeded(DataWin* dw, uint32_t audioEntryId) {
+    if (!dw) return;
     Audo* a = &dw->audo;
+    if (!a->entries || audioEntryId >= a->count) return;
     AudioEntry* entry = &a->entries[audioEntryId];
 
     if (!entry->present || entry->dataSize == 0) return;

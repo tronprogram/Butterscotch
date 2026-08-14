@@ -960,6 +960,8 @@ void DataWin_bumpVersionTo(DataWin* dw, uint32_t major, uint32_t minor, uint32_t
 void GamePath_computeInternal(GamePath* path);
 PathPositionResult GamePath_getPosition(GamePath* path, float t);
 void DataWin_loadTxtrIfNeeded(DataWin* dw, uint32_t textureId);
+// Read a slice of a TXTR blob without loading the whole page into RAM.
+bool DataWin_readTxtr(DataWin* dw, uint32_t textureId, uint32_t relOff, uint32_t size, void* dest);
 void DataWin_loadAudoIfNeeded(DataWin* dw, uint32_t audioEntryId);
 
 #endif /* _BS_DATA_WIN_H_ */

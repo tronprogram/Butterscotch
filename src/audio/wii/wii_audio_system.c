@@ -204,11 +204,18 @@ static bool decodeMemoryAudio(const uint8_t* data, uint32_t size,
     return true;
 }
 
+static DataWin* audioGroupOrNull(WiiAudioSystem* sys, int32_t groupIndex) {
+    if (groupIndex < 0 || groupIndex >= (int32_t)arrlen(sys->base.audioGroups)) return NULL;
+    DataWin* group = sys->base.audioGroups[groupIndex];
+    return group ? group : sys->base.dw;
+}
+
 static bool decodeEmbeddedSound(DataWin* dw, Sound* sound,
                                 int16_t** outPcm, uint32_t* outCount,
                                 int* outChannels, uint32_t* outRate) {
+    if (!dw) return false;
     int32_t audioFile = sound->audioFile;
-    if (audioFile < 0 || (uint32_t)audioFile >= dw->audo.count) return false;
+    if (audioFile < 0 || (uint32_t)audioFile >= dw->audo.count || !dw->audo.entries) return false;
 
     DataWin_loadAudoIfNeeded(dw, (uint32_t)audioFile);
     AudioEntry* entry = &dw->audo.entries[audioFile];
@@ -225,7 +232,7 @@ static DecodedSound* findOrDecodeEmbedded(WiiAudioSystem* sys, int32_t soundInde
     uint32_t count = 0;
     int channels = 0;
     uint32_t rate = 0;
-    DataWin* group = sys->base.audioGroups[sound->audioGroup];
+    DataWin* group = audioGroupOrNull(sys, sound->audioGroup);
     if (!group) group = sys->base.dw;
     if (!decodeEmbeddedSound(group, sound, &pcm, &count, &channels, &rate)) {
         return NULL;
@@ -515,6 +522,12 @@ static void wiiDestroy(AudioSystem* audio) {
         sys->streams[i].active = false;
     }
     AESND_Reset();
+    if (arrlen(sys->base.audioGroups) > 1) {
+        for (int32_t i = 1; i < (int32_t)arrlen(sys->base.audioGroups); i++) {
+            DataWin_free(sys->base.audioGroups[i]);
+        }
+    }
+    arrfree(sys->base.audioGroups);
     free(sys);
 }
 
@@ -855,8 +868,53 @@ static void wiiSetMasterGainForListener(AudioSystem* audio, float gain, MAYBE_UN
 }
 
 static void wiiSetChannelCount(MAYBE_UNUSED AudioSystem* audio, MAYBE_UNUSED int32_t count) {}
-static void wiiGroupLoad(MAYBE_UNUSED AudioSystem* audio, MAYBE_UNUSED int32_t groupIndex) {}
-static bool wiiGroupIsLoaded(MAYBE_UNUSED AudioSystem* audio, MAYBE_UNUSED int32_t groupIndex) { return true; }
+
+static void wiiGroupLoad(AudioSystem* audio, int32_t groupIndex) {
+    WiiAudioSystem* sys = (WiiAudioSystem*)audio;
+    if (groupIndex <= 0) return;
+    if (arrlen(audio->audioGroups) > groupIndex) return;
+
+    if (!audio->dw || audio->dw->agrp.count <= (uint32_t)groupIndex) {
+        logWarn("Audio: Wanted to load Audio Group %d, but it does not exist in AGRP!\n", groupIndex);
+        return;
+    }
+
+    AudioGroup* audioGroupEntry = &audio->dw->agrp.audioGroups[groupIndex];
+    char* buf;
+    if (audioGroupEntry->path == nullptr) {
+        int sz = snprintf(nullptr, 0, "audiogroup%d.dat", groupIndex);
+        buf = (char*)safeMalloc((size_t)sz + 1);
+        snprintf(buf, (size_t)sz + 1, "audiogroup%d.dat", groupIndex);
+    } else {
+        buf = safeStrdup(audioGroupEntry->path);
+    }
+
+    FileSystem* fileSystem = sys->fileSystem;
+    if (!fileSystem || !fileSystem->vtable->fileExists(fileSystem, buf)) {
+        logWarn("Audio: Wanted to load Audio Group %d, but the audiogroup file does not exist!\n", groupIndex);
+        free(buf);
+        arrput(audio->audioGroups, (DataWin*)safeCalloc(1, sizeof(DataWin)));
+        return;
+    }
+
+    char* resolved = fileSystem->vtable->resolvePath(fileSystem, buf);
+    free(buf);
+    if (!resolved) {
+        arrput(audio->audioGroups, (DataWin*)safeCalloc(1, sizeof(DataWin)));
+        return;
+    }
+
+    DataWinParserOptions options = {0};
+    options.parseAudo = true;
+    options.lazyLoadAudio = audio->dw->lazyLoadAudio;
+    DataWin* audioGroup = DataWin_parse(resolved, options);
+    free(resolved);
+    arrput(audio->audioGroups, audioGroup);
+}
+
+static bool wiiGroupIsLoaded(AudioSystem* audio, int32_t groupIndex) {
+    return arrlen(audio->audioGroups) > groupIndex;
+}
 
 static int32_t wiiCreateStream(AudioSystem* audio, const char* filename) {
     WiiAudioSystem* sys = (WiiAudioSystem*)audio;

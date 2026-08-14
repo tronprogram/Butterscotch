@@ -4,6 +4,7 @@
 #include "debug_font.h"
 #include "runner.h"
 #include "utils.h"
+#include "wii_games.h"
 #include "wii_overlay.h"
 
 #include <gccore.h>
@@ -27,6 +28,7 @@ typedef enum {
     SCREEN_EXTRAS,
     SCREEN_ABOUT,
     SCREEN_REBIND,
+    SCREEN_GAMES,
 } MenuScreen;
 
 typedef struct {
@@ -60,6 +62,9 @@ typedef struct {
     int rebindIndex;
     bool waitingRebind;
     int roomPresetIndex;
+    const WiiGameEntry* games;
+    int gameCount;
+    int gameIndex;
 } BootUi;
 
 static BootUi gUi;
@@ -552,6 +557,10 @@ static MenuAction tickScreen(
             if (gUi.cursor >= items) gUi.cursor = items - 1;
             if (down & WPAD_BUTTON_B) {
                 if (inGame) return ACT_RESUME;
+                if (!inGame && gUi.gameCount > 1) {
+                    gUi.screen = SCREEN_GAMES;
+                    gUi.cursor = gUi.gameIndex;
+                }
             }
             if (down & (WPAD_BUTTON_A | WPAD_BUTTON_PLUS)) {
                 if (!inGame) {
@@ -687,6 +696,19 @@ static MenuAction tickScreen(
         }
         case SCREEN_REBIND:
             break;
+        case SCREEN_GAMES: {
+            int items = gUi.gameCount > 0 ? gUi.gameCount : 1;
+            if (gUi.cursor >= items) gUi.cursor = items - 1;
+            if (down & (WPAD_BUTTON_A | WPAD_BUTTON_PLUS)) {
+                gUi.gameIndex = gUi.cursor;
+                gUi.screen = SCREEN_MAIN;
+                gUi.cursor = 0;
+            }
+            if (down & WPAD_BUTTON_B) {
+                return ACT_EXIT_TO_WII_MENU;
+            }
+            break;
+        }
     }
     return ACT_NONE;
 }
@@ -722,6 +744,21 @@ static void drawScreen(int fbW, int fbH, const WiiPortSettings* settings, bool i
     }
 
     switch (gUi.screen) {
+        case SCREEN_GAMES: {
+            static const HintPart gameHint[] = {
+                { WII_CTRL_ICON_DPAD, " select" },
+                { WII_CTRL_ICON_WM_A, " confirm" },
+            };
+            y = drawMenuChrome(fbW, fbH, "Games", "Converted packages on this SD", gameHint, 2);
+            if (gUi.gameCount <= 0) {
+                uiDrawText(x, y, UI_TEXT_SCALE, 200, 200, 210, 255, "No games found.");
+            } else {
+                for (int i = 0; i < gUi.gameCount; i++) {
+                    drawSelectable(x, y + UI_LINE * (float)i, gUi.cursor == i, gUi.games[i].title);
+                }
+            }
+            break;
+        }
         case SCREEN_MAIN: {
             static const HintPart mainHint[] = {
                 { WII_CTRL_ICON_DPAD, " move" },
@@ -730,7 +767,9 @@ static void drawScreen(int fbW, int fbH, const WiiPortSettings* settings, bool i
             };
             y = drawMenuChrome(fbW, fbH,
                                inGame ? "Butterscotch  |  System" : "Butterscotch",
-                               inGame ? "Game paused" : "Wii Undertale port",
+                               inGame ? "Game paused"
+                                      : (gUi.gameCount > 0 ? gUi.games[gUi.gameIndex].title
+                                                           : "Wii GameMaker runner"),
                                mainHint, 3);
             if (!inGame) {
                 drawSelectable(x, y + UI_LINE * 0, gUi.cursor == 0, "Start Game");
@@ -872,8 +911,8 @@ static MenuAction runMenuLoop(
 ) {
     (void)runner;
     uiInitFont();
-    gUi.screen = SCREEN_MAIN;
-    gUi.cursor = 0;
+    gUi.screen = (!inGame && gUi.gameCount > 1) ? SCREEN_GAMES : SCREEN_MAIN;
+    gUi.cursor = (!inGame && gUi.gameCount > 1) ? gUi.gameIndex : 0;
     gUi.waitingRebind = false;
     gUi.roomPresetIndex = findRoomPresetIndex(settings);
     bool dirty = false;
@@ -915,12 +954,21 @@ WiiBootResult WiiBootMenu_run(
     void* xfb1,
     u32* fbIndex,
     const char* bundleDir,
-    WiiPortSettings* settings
+    WiiPortSettings* settings,
+    const WiiGameEntry* games,
+    int gameCount,
+    int* selectedGame
 ) {
     WPAD_Init();
     PAD_Init();
-    logInfo("WiiBootMenu: entering pre-boot shell\n");
+    gUi.games = games;
+    gUi.gameCount = gameCount;
+    gUi.gameIndex = (selectedGame && *selectedGame >= 0 && *selectedGame < gameCount)
+        ? *selectedGame : 0;
+    logInfo("WiiBootMenu: entering pre-boot shell (%d game%s)\n",
+            gameCount, gameCount == 1 ? "" : "s");
     MenuAction act = runMenuLoop(rmode, xfb0, xfb1, fbIndex, bundleDir, settings, false, NULL);
+    if (selectedGame) *selectedGame = gUi.gameIndex;
     if (act == ACT_EXIT_TO_WII_MENU) return WII_BOOT_RETURN_TO_MENU;
     return WII_BOOT_START_GAME;
 }

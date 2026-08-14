@@ -22,6 +22,7 @@
 #include "noop_audio_system.h"
 #include "wii_overlay.h"
 #include "wii_boot_menu.h"
+#include "wii_games.h"
 #include "wii_settings.h"
 #include "../utils.h"
 #include "../gettime.h"
@@ -300,27 +301,23 @@ int main(int argc, char* argv[]) {
         hangBlackScreen();
     }
 
-    // ===[ Locate data.win ]===
-    static const char* const candidates[] = {
-        "sd:/apps/butterscotch/data.win",
-        "sd:/butterscotch/data.win",
-    };
-    const char* dataWinPath = NULL;
-    const char* bundleDir   = NULL;
-    for (int ci = 0; ci < 2; ci++) {
-        FILE* f = fopen(candidates[ci], "rb");
-        if (f) {
-            fclose(f);
-            dataWinPath = candidates[ci];
-            bundleDir   = (ci == 0) ? "sd:/apps/butterscotch/" : "sd:/butterscotch/";
-            break;
-        }
+    // ===[ Discover games ]===
+    // HL1-style: sd:/apps/butterscotch/games/<id>/data.win (ut, dr, …).
+    // Legacy: a single data.win next to boot.dol still works.
+    WiiGameEntry games[WII_GAMES_MAX];
+    int gameCount = WiiGames_scan("sd:/apps/butterscotch", games, WII_GAMES_MAX);
+    if (gameCount == 0) {
+        gameCount = WiiGames_scan("sd:/butterscotch", games, WII_GAMES_MAX);
     }
-    if (dataWinPath == NULL) {
-        logError("data.win not found on SD card.\n");
+    if (gameCount == 0) {
+        logError("No converted games found.\n");
+        logError("Put data.win in sd:/apps/butterscotch/games/<id>/ (see README).\n");
         hangBlackScreen();
     }
-    logInfo("Found data.win at %s\n", dataWinPath);
+    logInfo("Found %d game%s\n", gameCount, gameCount == 1 ? "" : "s");
+    for (int i = 0; i < gameCount; i++) {
+        logInfo("  [%d] %s (%s)\n", i, games[i].title, games[i].path);
+    }
 
     // ===[ Port settings + pre-boot shell ]===
     u32 fbIndex = 0;
@@ -328,15 +325,30 @@ int main(int argc, char* argv[]) {
     gXfb0 = xfb0;
     gXfb1 = xfb1;
     gFbIndex = &fbIndex;
-    gBundleDir = bundleDir;
-    WiiSettings_load(&gPortSettings, bundleDir);
+    const char* engineDir = "sd:/apps/butterscotch/";
+    gBundleDir = engineDir;
+    WiiSettings_load(&gPortSettings, engineDir);
     {
         char saveDir[128];
-        snprintf(saveDir, sizeof(saveDir), "%ssaves/", bundleDir);
+        snprintf(saveDir, sizeof(saveDir), "%ssaves/", engineDir);
         mkdir(saveDir, 0755);
     }
-    if (WiiBootMenu_run(rmode, xfb0, xfb1, &fbIndex, bundleDir, &gPortSettings) == WII_BOOT_RETURN_TO_MENU) {
+    int selectedGame = 0;
+    if (WiiBootMenu_run(rmode, xfb0, xfb1, &fbIndex, engineDir, &gPortSettings,
+                        games, gameCount, &selectedGame) == WII_BOOT_RETURN_TO_MENU) {
         returnToWiiMenu();
+    }
+    if (selectedGame < 0 || selectedGame >= gameCount) selectedGame = 0;
+    const char* bundleDir = games[selectedGame].path;
+    gBundleDir = bundleDir;
+    char dataWinPathBuf[WII_GAME_PATH_MAX + 16];
+    snprintf(dataWinPathBuf, sizeof(dataWinPathBuf), "%sdata.win", bundleDir);
+    const char* dataWinPath = dataWinPathBuf;
+    logInfo("Starting %s from %s\n", games[selectedGame].title, dataWinPath);
+    {
+        char saveDir[192];
+        snprintf(saveDir, sizeof(saveDir), "%ssaves/", bundleDir);
+        mkdir(saveDir, 0755);
     }
     applyPortMappings(&gPortSettings);
 
@@ -536,9 +548,12 @@ int main(int argc, char* argv[]) {
             uint64_t presentStart = nowNanos();
             GxRenderer_presentDuplicate(renderer);
             lastPresentMs = (float)((double)(nowNanos() - presentStart) / 1e6);
+            // Spare 60Hz slot: decode here so GML Step/Draw aren't behind PNG inflate.
+            GxRenderer_pumpTexLoads(renderer, 8ull * 1000ull * 1000ull);
+        } else if (roomSpeed > 35 || !havePresented) {
+            // 60fps rooms have no duplicate VI; still have to stream on the game tick.
+            GxRenderer_pumpTexLoads(renderer, 2ull * 1000ull * 1000ull);
         }
-
-        GxRenderer_pumpTexLoads(renderer, 2ull * 1000ull * 1000ull);
 
         float stepMs = 0.0f;
         float drawMs = 0.0f;

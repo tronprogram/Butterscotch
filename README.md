@@ -47,26 +47,56 @@ Felk Python-scripting Dolphin + `mcp-dolphin` remain a **Windows** debug path (`
 
 Outputs `build-wii/butterscotch.dol` and stages `build-wii/apps/butterscotch/{boot.dol,meta.xml,icon.png}`.
 
-### Load the game (after you have a `.dol`)
+### Convert textures (required)
 
-Butterscotch looks for game files under **`sd:/apps/butterscotch/`** (HBC layout). Put the runner and Undertale assets in the same folder:
+Wii GX cannot sample the stock 2048-wide GameMaker atlases. **You must convert `data.win` before it will run properly.** Each game has its own bake:
+
+| Profile | Game | Format | Command |
+| ------- | ---- | ------ | ------- |
+| `ut` | Undertale | WTL1 tiled PNG (face/battle pages 1:1) | `python3 src/wii/scripts/bs-convert.py ut -i data.win.orig -o data.win` |
+| `dr` | Deltarune | WTL2 pre-swizzled RGB5A3 | `python3 src/wii/scripts/bs-convert.py dr -i chapter1_windows/data.win -o data.win` |
+
+GUI (tkinter): `python3 src/wii/scripts/bs-convert-gui.py`
+
+### Load games (after you have a `.dol`)
+
+The runner is a **game loader**. Put the DOL once, then one folder per game so they do not overwrite each other:
 
 ```
 apps/butterscotch/
-  boot.dol          # from the build (or rename butterscotch.dol → boot.dol)
-  meta.xml          # from packaging/wii/ (HBC listing)
-  icon.png          # from packaging/wii/ (HBC icon, 128×48)
-  data.win          # Undertale data.win (WTL1-prepared if you use the texture pipeline)
-  *.ogg             # Undertale music/SFX next to data.win (required for audio)
-  CONFIG.JSN        # optional
-  saves/            # created at runtime
+  boot.dol
+  meta.xml
+  icon.png
+  games/
+    ut/                 # Undertale
+      game.json         # optional {"title":"Undertale","id":"ut"}
+      data.win          # converted
+      *.ogg
+      saves/
+    dr/                 # Deltarune
+      game.json
+      data.win          # converted WTL2
+      *.ogg
+      audiogroup1.dat
+      lang/
+      mus/
+      saves/
 ```
 
-**Homebrew Channel (real SD / USB loader):** copy that whole `apps/butterscotch` folder onto the SD card’s `apps/` directory, then launch **Butterscotch** from HBC.
+On boot, if more than one `games/<id>/data.win` exists, the shell lists them. A leftover `apps/butterscotch/data.win` (old layout) is still accepted as a single-game fallback.
 
-**Dolphin:** enable Wii SD card + folder sync, point the sync folder at a directory that contains `apps/butterscotch/` as above (Windows often uses `%AppData%\Dolphin Emulator\Load\WiiSDSync`), then open/run `boot.dol` (File → Open, or `Dolphin.exe -e path\to\boot.dol`).
+**Homebrew Channel:** copy `apps/butterscotch` onto the SD card, then launch **Butterscotch** from HBC.
 
-On first boot, use the on-screen shell (**Controls**) to pick a preset (vertical/horizontal Wiimote, GameCube, Classic). Default vertical Wiimote map: D-pad → arrows, A→Z, B→X, +→Enter, −→Shift, 1→C, 2→Escape. In-game, **HOME** opens the system menu.
+**Dolphin (shared SD, both games):**
+
+```bash
+./src/wii/scripts/run-wii-dolphin.sh              # stages games/ut
+./src/wii/scripts/run-wii-dolphin-deltarune.sh 1  # stages games/dr, same .dolphin-user
+```
+
+Do **not** `rsync --delete` the whole `apps/butterscotch` tree — that was wiping the other game.
+
+On first boot, use **Controls** to pick a preset. Default vertical Wiimote: D-pad → arrows, A→Z, B→X, +→Enter, −→Shift, 1→C, 2→Escape. In-game, **HOME** opens the system menu.
 
 ---
 

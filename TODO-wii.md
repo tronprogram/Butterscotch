@@ -46,6 +46,7 @@ Status as of 2026-08-12: playable through True Pacifist finale on Dolphin (frien
 ## Debug references
 
 - Build: `src/wii/scripts/build-wii-docker.sh` (macOS/Linux) · `src/wii/scripts/build-wii.ps1` (Windows)
-- Run: `src/wii/scripts/run-wii-dolphin.sh` → `build-wii/apps/butterscotch/boot.dol`
-- Textures: `src/wii/scripts/build-wii-data-win.sh` (needs `data.win.orig`; Pillow venv `tools/.venv-wii-tex`)
+- Run: `src/wii/scripts/run-wii-dolphin.sh` → stages `games/ut` on `.dolphin-user`
+- Deltarune: `src/wii/scripts/run-wii-dolphin-deltarune.sh 1` → stages `games/dr` on the same SD (does not wipe ut)
+- Convert: `src/wii/scripts/bs-convert.py ut|dr` (GUI: `bs-convert-gui.py`); GX needs a baked `data.win`
 - Windows MCP: `src/wii/scripts/run-wii-dolphin-mcp.ps1` · bridge `tools/dolphin-mcp/mcp_bridge.py`

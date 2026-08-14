@@ -2,6 +2,7 @@
 #define _BS_WII_BOOT_MENU_H_
 
 #include "wii_settings.h"
+#include "wii_games.h"
 
 #include <gccore.h>
 #include <stdint.h>
@@ -21,7 +22,10 @@ WiiBootResult WiiBootMenu_run(
     void* xfb1,
     u32* fbIndex,
     const char* bundleDir,
-    WiiPortSettings* settings
+    WiiPortSettings* settings,
+    const WiiGameEntry* games,
+    int gameCount,
+    int* selectedGame
 );
 
 // In-game HOME system menu. Returns true if caller should soft-reset via game_restart.
